@@ -1,4 +1,6 @@
-# Venice OpenAI Proxy
+# Unofficial Venice Proxy
+
+> Unofficial project, not affiliated with or endorsed by Venice.ai. Fork of [despin/venice-ai-chat-proxy](https://github.com/despin/venice-ai-chat-proxy).
 
 This project exposes the Venice web app as an OpenAI-compatible API so tools like Open WebUI can use your Venice web session without going through the official Venice API route.
 

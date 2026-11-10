@@ -1,4 +1,6 @@
 {
+  "name": "unofficial-venice-proxy",
+  "private": true,
   "scripts": {
     "check:concurrency": "node ./check/concurrency.mjs",
     "check:context": "node ./check/context.mjs",
