@@ -405,7 +405,11 @@ How it works:
      (`<|DSML| invoke name="write">`); that spelling, and mixed ones, are accepted, also
      across stream deltas. Closing tags may put the slash after the pipe
      (`<|/DSML|parameter>`). A single parameter named `arguments` whose value is an object
-     is unwrapped into the call's arguments.
+     is unwrapped into the call's arguments, also when a `name` parameter repeating the tool
+     name sits next to it. The model sometimes glues the value to the name with a colon and
+     leaves out the `>`: `<|DSML|parameter name="arguments":{"path":"a.js",…}}</|DSML|parameter>`.
+     That value is read as the JSON at its start (a stray trailing `}` is ignored), and a `>`
+     inside it (an arrow function, say) is not taken for the end of the tag.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
@@ -483,6 +487,8 @@ a template literal, and a multi-file search.
 | `qwen3-6-27b` | `proxy` | 20/20 | 20/20 | — | experimental |
 | `qwen3-5-35b-a3b` | `proxy` | 20/20 | 16/20 | — | experimental |
 | `e2ee-qwen3-6-35b-a3b` | `proxy` | not measured | — | — | experimental |
+| `deepseek-v4-1-flash-uncensored` | `json` (+ DSML) | 79/80 | 79/80 | — | experimental |
+| `deepseek-v4-1-flash` | `json` | 35/80 | 34/80 | — | unsupported |
 | `deepseek-v4-1-flash-free` and other agent-endpoint models | — | — | — | — | unsupported |
 
 - Missing trailing newlines are the models' habit: they mostly drop a file's single final
@@ -495,6 +501,13 @@ a template literal, and a multi-file search.
   the tag Venice strips while thinking. The prompt no longer names that tag, and an empty
   reply is retried once with the format repeated. With those fixes the final run had no
   failures and no retries.
+- The DeepSeek rows were measured in November 2026 with 20 runs per mode (80 per model).
+  `deepseek-v4-1-flash-uncensored` answered 87 of 106 upstream replies in XML DSML instead
+  of the requested `<tool_call>` JSON; all of them were parsed, none needed a retry, and the
+  one failure was over-escaped file content (`\"` written for `"`). Without the DSML parser
+  most of these calls reached the client as text. `deepseek-v4-1-flash` mostly fails the
+  other way: Venice ends the stream after the reasoning with empty content (115 of 156
+  replies, with no call in the reasoning either), so the retry rarely helps.
 - Qwen 3.8 can get stuck reasoning; the reasoning budget below stops it.
 - Agent-endpoint models answer requests with tools with a 400: Venice runs only its own
   server-side tools there (see [Agent endpoint models](#agent-endpoint-models)).

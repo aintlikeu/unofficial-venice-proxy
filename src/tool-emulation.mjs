@@ -1109,6 +1109,27 @@ function parseNamedCall(body, tools, terminated) {
   return parseCallArguments(tool, rest, terminated);
 }
 
+// name="key": followed by a JSON value, with no closing ">".
+const DSML_GLUED_PARAMETER = /^\s*name\s*=\s*"([^"]*)"\s*:\s*/;
+const JSON_LEADING_SCALAR = /^(?:"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/;
+
+// The JSON value at the start of `text`, ignoring whatever follows it.
+function parseLeadingJsonValue(text) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return parseJsonLenient(trimmed);
+  }
+  const scalar = JSON_LEADING_SCALAR.exec(trimmed);
+  if (!scalar) {
+    return null;
+  }
+  try {
+    return { value: JSON.parse(scalar[0]) };
+  } catch {
+    return null;
+  }
+}
+
 // Attributes inside a DSML tag: name="value", name='value', name=value.
 function parseDsmlAttributes(text) {
   const attributes = {};
@@ -1124,6 +1145,12 @@ function parseDsmlAttributes(text) {
 function parseDsmlParameterValue(attributes, text, tool, key) {
   if (attributes.string === "true") {
     return text;
+  }
+  // A glued value is JSON, often followed by a stray "}" (the model closes an
+  // object it never opened), so read the leading value.
+  if (attributes.glued) {
+    const parsed = parseLeadingJsonValue(text);
+    return parsed ? parsed.value : text;
   }
   const property = tool.parameters?.properties?.[key];
   const parsed = parseJsonLenient(text.trim(), { whole: true });
@@ -1154,16 +1181,28 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
     if (start.index === -1) {
       break;
     }
-    const tagEnd = source.indexOf(">", start.index + start.token.length);
-    if (tagEnd === -1) {
-      if (!terminated) {
-        break;
+    const afterToken = start.index + start.token.length;
+    // Glued form, seen live: <|DSML|parameter name="arguments":{…}}</|DSML|parameter>.
+    // The tag has no ">", and the value may contain one ("=>"), so the value
+    // starts right after the colon instead of after the next ">".
+    const glued = DSML_GLUED_PARAMETER.exec(source.slice(afterToken));
+    let attributes;
+    let valueStart;
+    if (glued) {
+      attributes = { name: glued[1], glued: true };
+      valueStart = afterToken + glued[0].length;
+    } else {
+      const tagEnd = source.indexOf(">", afterToken);
+      if (tagEnd === -1) {
+        if (!terminated) {
+          break;
+        }
+        return { error: `unterminated parameter for "${tool.name}"` };
       }
-      return { error: `unterminated parameter for "${tool.name}"` };
+      attributes = parseDsmlAttributes(source.slice(afterToken, tagEnd));
+      valueStart = tagEnd + 1;
     }
-    const attributes = parseDsmlAttributes(source.slice(start.index + start.token.length, tagEnd));
     const key = String(attributes.name ?? "").trim();
-    const valueStart = tagEnd + 1;
     const valueEnd = findEarliestToken(source, DSML_XML_PARAMETER_END_VARIANTS, valueStart);
     if (valueEnd.index === -1) {
       if (!terminated) {
@@ -1185,14 +1224,25 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
     return { error: `unrecognized arguments for "${tool.name}"` };
   }
   // Some builds wrap the whole argument object in one parameter named
-  // "arguments"; unwrap it unless the tool really declares that name.
-  const declared = tool.parameters?.properties;
+  // "arguments", sometimes next to a "name" parameter repeating the tool name
+  // (the {"name", "arguments"} call object split into parameters). Unwrap it
+  // unless the tool really declares those names.
+  const declared = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
+  const extraKeys = Object.keys(parsedArgs).filter((key) => key !== "arguments");
+  const nameEchoesTool =
+    extraKeys.length === 1 &&
+    extraKeys[0] === "name" &&
+    !Object.hasOwn(declared, "name") &&
+    String(parsedArgs.name).trim() === tool.name;
   if (
-    Object.keys(parsedArgs).length === 1 &&
     isPlainObject(parsedArgs.arguments) &&
-    !(isPlainObject(declared) && Object.hasOwn(declared, "arguments"))
+    !Object.hasOwn(declared, "arguments") &&
+    (extraKeys.length === 0 || nameEchoesTool)
   ) {
     return buildToolCall(tool, parsedArgs.arguments);
+  }
+  if (extraKeys.includes("name") && !Object.hasOwn(declared, "name") && isPlainObject(parsedArgs.arguments)) {
+    return { error: `"name" parameter "${parsedArgs.name}" does not match tool "${tool.name}"` };
   }
   return buildToolCall(tool, parsedArgs);
 }

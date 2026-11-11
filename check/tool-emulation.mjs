@@ -1339,10 +1339,7 @@ async function testProxyWiring() {
     upstream = messages;
     return { events: (async function* () { yield* agentEvents; })() };
   };
-  // Stub every account, not only the one that is active at start: the pool
-  // rotates per request, so a discoverable sibling session file would send the
-  // later requests to the real client (401) and fail the rest of this check.
-  const clients = new Set([proxy.client, ...proxy.accounts.map((account) => account.client)]);
+  const clients = [proxy.client];
   for (const client of clients) {
     client.chat = stubChat;
     client.openChatStream = stubChatStream;
@@ -1844,6 +1841,76 @@ function testDsml() {
   );
   ok("arguments-wrapper shell call parsed", shellOk.toolCalls.length === 1);
   ok("arguments-wrapper shell command parsed", args(shellOk.toolCalls[0]).command === "git status");
+
+  // Captured live (deepseek-v4-1-flash-uncensored, 2026-11-11): the argument
+  // object is glued to the name attribute with ":" and the opening tag has no
+  // ">". The content holds "=>", which must not be taken for the tag end.
+  const writeTool = {
+    name: "write",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+      required: ["path", "content"],
+    },
+  };
+  const gluedContent = "export const greet = (n) => `hi ${n}\\n`;\n";
+  const glued = String.raw`
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="write">
+<｜DSML｜ parameter name="arguments":{"path":"src/greet.js","content":"export const greet = (n) => ` + "`hi ${n}" + String.raw`\\n` + "`" + String.raw`;\n"}}</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>`;
+  const gluedCase = parseToolCalls(glued, [writeTool]);
+  ok("glued arguments object parsed", gluedCase.toolCalls.length === 1);
+  ok("glued arguments path parsed", gluedCase.toolCalls[0] && args(gluedCase.toolCalls[0]).path === "src/greet.js");
+  ok("glued arguments content kept verbatim", gluedCase.toolCalls[0] && args(gluedCase.toolCalls[0]).content === gluedContent);
+  ok("glued arguments leave no content", gluedCase.content === null);
+
+  const gluedStream = createToolCallParser([writeTool]);
+  const gluedEvents = [];
+  for (const char of glued) {
+    gluedEvents.push(...gluedStream.push(char));
+  }
+  gluedEvents.push(...gluedStream.end());
+  const gluedCalls = gluedEvents.filter((event) => event.type === "tool_call");
+  ok("streamed glued arguments object parsed",
+    gluedCalls.length === 1 && args(gluedCalls[0].toolCall).content === gluedContent);
+  ok("streamed glued arguments leave no stray text",
+    gluedEvents.filter((event) => event.type === "text").map((event) => event.text).join("").trim() === "");
+
+  // Also live: the call object is split into an "arguments" and a "name"
+  // parameter, the second one glued to a JSON string.
+  const gluedWithName = glued.replace(
+    "</｜DSML｜ parameter>\n</｜DSML｜ invoke>",
+    '</｜DSML｜ parameter>\n<｜DSML｜ parameter name="name":"write"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>',
+  );
+  const nameCase = parseToolCalls(gluedWithName, [writeTool]);
+  ok("glued arguments with a name parameter parsed", nameCase.toolCalls.length === 1);
+  ok("glued name parameter is not passed as an argument",
+    nameCase.toolCalls[0] && JSON.stringify(Object.keys(args(nameCase.toolCalls[0]))) === '["path","content"]');
+  ok("glued arguments with a name keep the content",
+    nameCase.toolCalls[0] && args(nameCase.toolCalls[0]).content === gluedContent);
+
+  // A tool that declares "name" keeps it, and a "name" naming another tool
+  // is not dropped silently.
+  const namedTool = {
+    name: "rename",
+    parameters: {
+      type: "object",
+      properties: { name: { type: "string" }, arguments: { type: "object" } },
+      required: ["name"],
+    },
+  };
+  const declaredName = parseToolCalls(
+    '<|DSML|calls><|DSML|invoke name="rename"><|DSML|parameter name="name" string="true">rename</|DSML|parameter><|DSML|parameter name="arguments">{"a":1}</|DSML|parameter></|DSML|invoke></|DSML|calls>',
+    [namedTool],
+  );
+  ok("declared name and arguments parameters are kept",
+    declaredName.toolCalls[0] && args(declaredName.toolCalls[0]).name === "rename" &&
+      args(declaredName.toolCalls[0]).arguments?.a === 1);
+  const otherName = parseToolCalls(gluedWithName.replace('"name":"write"', '"name":"bash"'), [writeTool]);
+  ok("a name naming another tool is not unwrapped", otherName.toolCalls.length === 0);
 }
 
 async function main() {
