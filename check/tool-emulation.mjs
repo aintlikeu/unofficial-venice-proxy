@@ -404,6 +404,10 @@ function testFormats() {
   ok("model suffix does not matter", resolveToolFormat("zai-org-glm-5-2:webEnabled=true") === "glm");
   ok("qwen models get the qwen format", resolveToolFormat("qwen3-235b-a22b") === "qwen");
   ok("other models get json", resolveToolFormat("deepseek-v4-1-flash-free") === "json");
+  ok("deepseek-v4-1-flash gets proxy", resolveToolFormat("deepseek-v4-1-flash") === "proxy");
+  ok("deepseek-v4-1-flash-uncensored keeps json", resolveToolFormat("deepseek-v4-1-flash-uncensored") === "json");
+  ok("VENICE_TOOL_FORMATS overrides the flash default",
+    resolveToolFormat("deepseek-v4-1-flash", parseToolFormatRules("deepseek=json").rules) === "json");
   const { rules, invalid } = parseToolFormatRules("glm=json, kimi=qwen ,bad, x=nope,*=glm");
   ok("env rules parsed", rules.length === 3 && invalid.join("|") === "bad|x=nope");
   ok("env rule overrides default", resolveToolFormat("zai-org-glm-5-2", rules) === "json");

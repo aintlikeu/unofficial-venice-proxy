@@ -331,7 +331,7 @@ How it works:
    | --- | --- | --- |
    | contains `glm` | `glm` (GLM-4.5+ template) | `<tool_call>read_file`<br>`<arg_key>path</arg_key>`<br>`<arg_value>src/a.js</arg_value>`<br>`</tool_call>` |
    | Qwen3-Coder (`qwen3-coder…`) | `json` (measured, see below) | `<tool_call>{"name": "read_file", "arguments": {"path": "src/a.js"}}</tool_call>` |
-   | Qwen 3.5 and later (`qwen3-5-…`, `qwen3-6-…`, `e2ee-qwen3-6-…`, `qwen-3-8-…`) | `proxy` (see below) | `<proxy_call>{"name": "read_file", "arguments": {"path": "src/a.js"}}</proxy_call>` |
+   | Qwen 3.5 and later (`qwen3-5-…`, `qwen3-6-…`, `e2ee-qwen3-6-…`, `qwen-3-8-…`), and exactly `deepseek-v4-1-flash` | `proxy` (see below) | `<proxy_call>{"name": "read_file", "arguments": {"path": "src/a.js"}}</proxy_call>` |
    | other Qwen (`qwen3-vl-…`, Qwen3/2507, `qwen3-8b`) | `qwen` (Qwen3 / Qwen3-VL template) | `<tool_call>`<br>`{"name": "read_file", "arguments": {"path": "src/a.js"}}`<br>`</tool_call>` |
    | anything else | `json` | `<tool_call>{"name": "read_file", "arguments": {"path": "src/a.js"}}</tool_call>` |
    | opt-in only (`VENICE_TOOL_FORMATS`) | `qwen-xml` (Qwen 3.5+ template; tools listed as JSON) | same as `qwen-coder` |
@@ -488,7 +488,7 @@ a template literal, and a multi-file search.
 | `qwen3-5-35b-a3b` | `proxy` | 20/20 | 16/20 | — | experimental |
 | `e2ee-qwen3-6-35b-a3b` | `proxy` | not measured | — | — | experimental |
 | `deepseek-v4-1-flash-uncensored` | `json` (+ DSML) | 79/80 | 79/80 | — | experimental |
-| `deepseek-v4-1-flash` | `json` | 35/80 | 34/80 | — | unsupported |
+| `deepseek-v4-1-flash` | `proxy` | 77/80 | 73/80 | — | experimental |
 | `deepseek-v4-1-flash-free` and other agent-endpoint models | — | — | — | — | unsupported |
 
 - Missing trailing newlines are the models' habit: they mostly drop a file's single final
@@ -505,9 +505,14 @@ a template literal, and a multi-file search.
   `deepseek-v4-1-flash-uncensored` answered 87 of 106 upstream replies in XML DSML instead
   of the requested `<tool_call>` JSON; all of them were parsed, none needed a retry, and the
   one failure was over-escaped file content (`\"` written for `"`). Without the DSML parser
-  most of these calls reached the client as text. `deepseek-v4-1-flash` mostly fails the
-  other way: Venice ends the stream after the reasoning with empty content (115 of 156
-  replies, with no call in the reasoning either), so the retry rarely helps.
+  most of these calls reached the client as text. `deepseek-v4-1-flash` drifts into DSML
+  too, but Venice cuts DSML out of that model's stream (asked to echo a DSML block, the
+  raw response came back with the block missing and nothing in its place), so with `json`
+  most replies were empty: 35/80, with 115 of 156 upstream replies empty. The `proxy`
+  format, whose rules say other tool-call syntax is removed, brings it to 77/80: two runs
+  stayed empty after the retry and one dropped backslashes in the file. The same format
+  on the uncensored build scored 79/80 too but kept fewer trailing newlines (74/79), so that
+  one stays on `json`. Turning reasoning off made both formats worse.
 - Qwen 3.8 can get stuck reasoning; the reasoning budget below stops it.
 - Agent-endpoint models answer requests with tools with a 400: Venice runs only its own
   server-side tools there (see [Agent endpoint models](#agent-endpoint-models)).

@@ -497,7 +497,17 @@ export const TOOL_FORMAT_NAMES = Object.keys(TOOL_FORMATS);
 // events with the call cut out of the text, even mid-reasoning; Qwen 3.6 did
 // the same (no call, no parser warning, only whitespace left). The version
 // must be followed by "-", "." or the end: "qwen3-8b" is Qwen3 8B, not 3.8.
+//
+// DeepSeek V4.1 Flash also gets the proxy format. On a long agent prompt it
+// drifts from <tool_call> to its native XML DSML (<｜DSML｜ invoke …>), and
+// Venice cuts DSML out of this model's stream, leaving an empty reply (a raw
+// dump showed "A4 <DSML block> Z4" arrive as "A4  Z4"). With json, 35/80
+// opencode-like runs succeeded; with proxy, whose rules say that other
+// tool-call syntax is removed, 77/80. The uncensored build keeps json: Venice
+// passes its DSML through, the parser reads it, and json kept more trailing
+// newlines there (79/79 vs 74/79) at the same 79/80.
 const DEFAULT_FORMAT_RULES = [
+  { match: /^deepseek-v4-1-flash$/, format: "proxy" },
   { match: /glm/, format: "glm" },
   { match: /qwen-?3[.-]?coder/, format: "json" },
   { match: /qwen-?3[.-][5-9](?=[-.]|$)/, format: "proxy" },
