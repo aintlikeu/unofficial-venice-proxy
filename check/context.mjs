@@ -6,6 +6,8 @@ import {
   createTokenCounter,
   estimatePromptTokens,
   estimateTokens,
+  foldSystemPrompt,
+  isUserPromptTooLongError,
 } from "../src/context.mjs";
 import { createVeniceOpenAiProxy, createVeniceOpenAiProxyServer } from "../src/proxy.mjs";
 
@@ -77,6 +79,37 @@ function testHelpers() {
       contextOverflowError(undefined) === null);
 }
 
+function testFoldHelpers() {
+  section("foldSystemPrompt / isUserPromptTooLongError");
+  ok("userPromptTooLong recognized", isUserPromptTooLongError(new Error('HTTP 413: {"error":"userPromptTooLong"}')));
+  ok("userMessageTooLong and other statuses are not",
+    !isUserPromptTooLongError(new Error('HTTP 413: {"error":"userMessageTooLong"}')) &&
+      !isUserPromptTooLongError(new Error('HTTP 500: {"error":"userPromptTooLong"}')) &&
+      !isUserPromptTooLongError(null));
+  ok("nothing to fold without a system prompt",
+    foldSystemPrompt([{ role: "user", content: "u" }], "") === null &&
+      foldSystemPrompt([{ role: "user", content: "u" }], undefined) === null);
+  const turns = [
+    { role: "user", content: "first" },
+    { role: "assistant", content: "a" },
+    { role: "user", content: "last" },
+  ];
+  const folded = foldSystemPrompt(turns, "S");
+  ok("folds into the first user turn only",
+    folded?.systemPrompt === "" &&
+      folded.promptMessages[0].content === "[System]\nS\n\n[User]\nfirst" &&
+      folded.promptMessages[2].content === "last" && folded.promptMessages.length === 3,
+    JSON.stringify(folded));
+  ok("input array left untouched", turns[0].content === "first");
+  const leadingAssistant = foldSystemPrompt([{ role: "assistant", content: "a" }], "S");
+  ok("adds a user turn in front of a leading assistant turn",
+    leadingAssistant?.promptMessages.length === 2 &&
+      leadingAssistant.promptMessages[0].role === "user" &&
+      leadingAssistant.promptMessages[0].content === "[System]\nS",
+    JSON.stringify(leadingAssistant));
+  ok("non-string content → null", foldSystemPrompt([{ role: "user", content: [{ type: "text" }] }], "S") === null);
+}
+
 function readSse(text) {
   return text
     .split("\n")
@@ -105,9 +138,14 @@ async function testProxy() {
     { kind: "content", content: "", reasoning_content: REASONING },
     ...[...replyText].map((char) => ({ kind: "content", content: char })),
   ];
+  // failIf narrows failWith to some requests; calls lists every upstream call.
+  let failIf = null;
+  const calls = [];
+  const shouldFail = (options) => failWith && (!failIf || failIf(options));
   proxy.client.chat = async (_jwt, _input, options) => {
     sent = options;
-    if (failWith) {
+    calls.push(options);
+    if (shouldFail(options)) {
       throw failWith;
     }
     const events = chatEvents();
@@ -115,7 +153,8 @@ async function testProxy() {
   };
   proxy.client.openChatStream = async (_jwt, _input, options) => {
     sent = options;
-    if (failWith) {
+    calls.push(options);
+    if (shouldFail(options)) {
       throw failWith;
     }
     const events = chatEvents();
@@ -276,6 +315,71 @@ async function testProxy() {
       ok("logged as a context overflow", logs.some((line) => line.includes("context overflow")));
     }
 
+    // Venice refuses some requests with a separate system prompt but takes
+    // the same text as one user message: the proxy retries once, folded.
+    const tooLong = () => new Error('HTTP 413: {"error":"userPromptTooLong"}');
+    const runFold = async (body, { error = tooLong(), when = (options) => options.systemPrompt !== "" } = {}) => {
+      failWith = error;
+      failIf = when;
+      calls.length = 0;
+      const result = await post(body);
+      failWith = null;
+      failIf = null;
+      return result;
+    };
+    for (const [label, body] of [
+      ["chat, stream=false", { model: "zai-org-glm-5-2", messages }],
+      ["chat, stream=true", { model: "zai-org-glm-5-2", stream: true, messages }],
+      ["emulated tools, stream=true", { model: "zai-org-glm-5-2", stream: true, messages, tools }],
+    ]) {
+      section(`413 with a system prompt, folded retry, ${label}`);
+      const result = await runFold(body);
+      ok("request succeeds after one retry", result.status === 200 && calls.length === 2,
+        `${result.status} calls=${calls.length} ${result.text.slice(0, 120)}`);
+      const [first, second] = calls;
+      const firstUser = second?.promptMessages.find((message) => message.role === "user");
+      ok("retry has no separate system prompt", second?.systemPrompt === "");
+      ok("system text leads the first user message",
+        firstUser?.content.startsWith(`[System]\n${first.systemPrompt}\n\n[User]\n`),
+        JSON.stringify(firstUser?.content.slice(0, 40)));
+      ok("user text kept after it", firstUser?.content.includes("u".repeat(700)));
+      ok("same number of turns", second?.promptMessages.length === first.promptMessages.length);
+      ok("retry gets its own request id", second?.requestId && second.requestId !== first.requestId);
+      ok("retry logged with both ids", logs.some((line) =>
+        line.includes("retrying once with it folded") && line.includes(`request_id=${first.requestId}`)));
+    }
+
+    section("folded retry keeps /no_think in front");
+    {
+      const result = await runFold({ model: "zai-org-glm-5-2", reasoning_effort: "none", messages });
+      const user = calls[1]?.promptMessages.find((message) => message.role === "user");
+      ok("request succeeds", result.status === 200, String(result.status));
+      ok("starts with /no_think [System]", user?.content.startsWith("/no_think [System]\n"),
+        JSON.stringify(user?.content.slice(0, 30)));
+    }
+
+    section("folded retry that fails again");
+    {
+      const result = await runFold({ model: "zai-org-glm-5-2", messages }, { when: () => true });
+      ok("one retry only", calls.length === 2, `calls=${calls.length}`);
+      ok("still the context-overflow 400", result.status === 400 &&
+        JSON.parse(result.text).error?.code === "context_length_exceeded", `${result.status}`);
+    }
+
+    section("no folded retry when it cannot help");
+    {
+      const noSystem = await runFold({ model: "zai-org-glm-5-2", messages: [messages[1]] }, { when: () => true });
+      ok("no system prompt → no retry, 400", calls.length === 1 && noSystem.status === 400,
+        `calls=${calls.length} ${noSystem.status}`);
+      const perMessage = await runFold({ model: "zai-org-glm-5-2", messages },
+        { error: new Error('HTTP 413: {"error":"userMessageTooLong"}'), when: () => true });
+      ok("userMessageTooLong → no retry, 400", calls.length === 1 && perMessage.status === 400,
+        `calls=${calls.length} ${perMessage.status}`);
+      const other = await runFold({ model: "zai-org-glm-5-2", messages },
+        { error: new Error('HTTP 500: {"error":"boom"}'), when: () => true });
+      ok("other errors → no retry", calls.length === 1 && other.status === 500, `calls=${calls.length} ${other.status}`);
+    }
+
     section("other upstream errors unchanged");
     failWith = new Error('HTTP 500: {"error":"boom"}');
     const result = await post({ model: "zai-org-glm-5-2", messages });
@@ -347,6 +451,7 @@ function testEnvOff() {
 
 async function main() {
   testHelpers();
+  testFoldHelpers();
   await testProxy();
   await testClientBody();
   testEnvOff();

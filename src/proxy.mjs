@@ -15,7 +15,14 @@ import {
   truncateSnippet,
 } from "./tool-emulation.mjs";
 import { replaceNullBytes } from "./venice-text.mjs";
-import { buildUsage, contextOverflowError, createTokenCounter, estimatePromptTokens } from "./context.mjs";
+import {
+  buildUsage,
+  contextOverflowError,
+  createTokenCounter,
+  estimatePromptTokens,
+  foldSystemPrompt,
+  isUserPromptTooLongError,
+} from "./context.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -375,6 +382,28 @@ async function retryModelOverloaded(operation, { label, model }) {
         await sleep(delayMs);
       }
     }
+  }
+}
+
+// Sends a chat-endpoint request; a 413 userPromptTooLong for a request with a
+// separate system prompt is retried once with that prompt folded into the
+// first user message (see foldSystemPrompt). Any other error, or a second 413,
+// goes to the caller unchanged.
+async function sendWithSystemPromptFallback(options, send) {
+  try {
+    return await send(options);
+  } catch (error) {
+    const folded = isUserPromptTooLongError(error)
+      ? foldSystemPrompt(options.promptMessages, options.systemPrompt)
+      : null;
+    if (!folded) {
+      throw error;
+    }
+    const retry = { ...options, ...folded, requestId: Math.random().toString(36).slice(2, 9) };
+    console.warn(
+      `[${nowIso()}] userPromptTooLong with a separate system prompt; retrying once with it folded into the first user message request_id=${options.requestId} retry_request_id=${retry.requestId}`,
+    );
+    return await send(retry);
   }
 }
 
@@ -1134,7 +1163,9 @@ class VeniceOpenAiProxy {
           requestId,
           resolveModelSettings: (id) => this.getModelSettings(id),
         });
-        const result = await this.client.chat(auth.login.clerkJwt, undefined, options);
+        const result = await sendWithSystemPromptFallback(options, (sent) =>
+          this.client.chat(auth.login.clerkJwt, undefined, sent),
+        );
         return { ...result, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion", model },
@@ -1160,7 +1191,9 @@ class VeniceOpenAiProxy {
           resolveModelSettings: (id) => this.getModelSettings(id),
           toolEmulation,
         });
-        const stream = await this.client.openChatStream(auth.login.clerkJwt, undefined, options);
+        const stream = await sendWithSystemPromptFallback(options, (sent) =>
+          this.client.openChatStream(auth.login.clerkJwt, undefined, sent),
+        );
         return { ...stream, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion stream", model },

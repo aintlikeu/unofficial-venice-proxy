@@ -61,6 +61,49 @@ export function buildUsage(promptTokens, completionTokens) {
 // the error looks like a context overflow: a 4xx with code
 // "context_length_exceeded" or a message such as "prompt is too long" (that is
 // what opencode checks), so it is returned as such instead of a 500.
+export function isUserPromptTooLongError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /^HTTP 413: [\s\S]*"userPromptTooLong"/.test(message);
+}
+
+// Venice also answers userPromptTooLong to requests far below the model's
+// context when a separate system prompt comes with one large user message,
+// which is what opencode sends after compacting (summary and recent turns in
+// one <conversation-checkpoint> message). Live on 2026-11-15 with
+// deepseek-v4-1-flash-uncensored: system 1K + one 159K-char user message got
+// 413 while 158K, 160K and 300K passed; without a system prompt every size up
+// to 800K passed; the failing opencode request (system 38K + 159K) passed with
+// the system text moved into the user message. The same text split over
+// several turns also passed. So such a 413 is retried once with the system
+// prompt folded into the first user message.
+//
+// Returns the folded { promptMessages, systemPrompt: "" }, or null when there
+// is nothing to fold. A leading "/no_think " stays at the very start.
+export function foldSystemPrompt(promptMessages, systemPrompt) {
+  if (typeof systemPrompt !== "string" || systemPrompt === "" || !Array.isArray(promptMessages)) {
+    return null;
+  }
+  const system = `[System]\n${systemPrompt}`;
+  const index = promptMessages.findIndex((message) => message?.role === "user");
+  if (index === -1) {
+    // Venice keeps only the last of same-role neighbours, so a new user turn
+    // only goes in front of a non-user first message.
+    return { promptMessages: [{ role: "user", content: system }, ...promptMessages], systemPrompt: "" };
+  }
+  const { content } = promptMessages[index];
+  if (typeof content !== "string") {
+    return null;
+  }
+  const NO_THINK = "/no_think ";
+  const prefix = content.startsWith(NO_THINK) ? NO_THINK : "";
+  const folded = [...promptMessages];
+  folded[index] = {
+    ...promptMessages[index],
+    content: `${prefix}${system}\n\n[User]\n${content.slice(prefix.length)}`,
+  };
+  return { promptMessages: folded, systemPrompt: "" };
+}
+
 export function contextOverflowError(error) {
   const message = error instanceof Error ? error.message : String(error ?? "");
   const match = /^HTTP 413: [\s\S]*"(userPromptTooLong|userMessageTooLong)"/.exec(message);
