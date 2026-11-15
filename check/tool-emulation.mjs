@@ -1917,6 +1917,117 @@ function testDsml() {
   ok("a name naming another tool is not unwrapped", otherName.toolCalls.length === 0);
 }
 
+// Shapes DeepSeek V4.1 Flash Uncensored wrote in a live opencode session
+// (proxy log, 2026-11-15) that used to fail and cost a retry. Checked whole
+// and streamed one character at a time.
+function testLiveDeepseekShapes() {
+  section("DeepSeek live shapes (opencode session)");
+  const shellTool = {
+    name: "shell",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" }, timeout: { type: "number" }, description: { type: "string" } },
+      required: ["command"],
+    },
+  };
+  const editTool = {
+    name: "edit",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, oldString: { type: "string" }, newString: { type: "string" } },
+      required: ["path", "oldString", "newString"],
+    },
+  };
+  const tools = [shellTool, editTool];
+  const both = (text) => {
+    const whole = parseToolCalls(text, tools);
+    const parser = createToolCallParser(tools);
+    const events = [];
+    for (const char of text) {
+      events.push(...parser.push(char));
+    }
+    events.push(...parser.end());
+    return {
+      whole,
+      streamed: {
+        calls: events.filter((event) => event.type === "tool_call").map((event) => event.toolCall),
+        text: events.filter((event) => event.type === "text").map((event) => event.text).join(""),
+        invalid: events.filter((event) => event.type === "invalid"),
+      },
+    };
+  };
+  const expectCalls = (label, text, expected, { content = null } = {}) => {
+    const { whole, streamed } = both(text);
+    const summary = (calls) => JSON.stringify(calls.map((call) => [call.function.name, args(call)]));
+    const want = JSON.stringify(expected);
+    ok(`${label}: parsed`, summary(whole.toolCalls) === want, summary(whole.toolCalls));
+    ok(`${label}: parsed when streamed`, summary(streamed.calls) === want && streamed.invalid.length === 0,
+      `${summary(streamed.calls)} invalid=${streamed.invalid.map((event) => event.reason).join("; ")}`);
+    ok(`${label}: content`, whole.content === content && streamed.text.trim() === (content ?? ""),
+      `${JSON.stringify(whole.content)} / ${JSON.stringify(streamed.text)}`);
+  };
+  const expectNoCall = (label, text) => {
+    const { whole, streamed } = both(text);
+    ok(`${label}: no call`, whole.toolCalls.length === 0 && streamed.calls.length === 0 && streamed.invalid.length === 1,
+      `${whole.toolCalls.length}/${streamed.calls.length}/${streamed.invalid.length}`);
+  };
+
+  const grep = 'cd /root/p && grep -rn "compile_check" --include=*.py .';
+
+  // 1. The argument object as JSON text in a string="true" parameter.
+  expectCalls("DSML arguments as a JSON string",
+    `<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">${JSON.stringify({ command: grep })}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: grep }]]);
+  expectCalls("DSML arguments as a JSON string next to a name parameter",
+    `<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">{"command":"ls"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name="name" string="true">shell</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: "ls" }]]);
+
+  // 2. Arguments next to "name", with an empty or missing "arguments".
+  expectCalls("flat arguments with an empty arguments object",
+    `<tool_call>${JSON.stringify({ command: grep, name: "shell", arguments: {} })}</tool_call>`,
+    [["shell", { command: grep }]]);
+  expectCalls("flat arguments without an arguments key",
+    `<tool_call>{"name":"edit","path":"/r/store.py","oldString":"class Store:","newString":"class Store(Base):"}</tool_call>`,
+    [["edit", { path: "/r/store.py", oldString: "class Store:", newString: "class Store(Base):" }]]);
+  expectCalls("flat arguments drop undeclared keys",
+    '<tool_call>{"name":"shell","command":"ls","type":"function"}</tool_call>',
+    [["shell", { command: "ls" }]]);
+  expectCalls("a non-empty arguments object wins over flat keys",
+    '<tool_call>{"name":"shell","arguments":{"command":"a"},"command":"b"}</tool_call>',
+    [["shell", { command: "a" }]]);
+
+  // 3. A DSML block inside <tool_call>, with and without </tool_call>.
+  const dsmlInWrapper = (close) =>
+    `Продолжаю.\n\n<tool_call>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="false">{"command": "sed -n 1,50p verify.py"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="false">{"command": "sed -n 170,205p proxy.py"}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>${close}`;
+  const twoCalls = [["shell", { command: "sed -n 1,50p verify.py" }], ["shell", { command: "sed -n 170,205p proxy.py" }]];
+  expectCalls("DSML inside an unclosed <tool_call>", dsmlInWrapper(""), twoCalls, { content: "Продолжаю." });
+  expectCalls("DSML inside a closed <tool_call>", dsmlInWrapper("\n</tool_call>"), twoCalls, { content: "Продолжаю." });
+  expectCalls("DSML inside <proxy_call>",
+    '<proxy_call><｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter></｜DSML｜ invoke></proxy_call>',
+    [["shell", { command: "ls" }]]);
+  expectCalls("JSON inside <tool_call> still parsed as JSON",
+    '<tool_call>\n{"name":"shell","arguments":{"command":"echo \\"<|DSML|invoke\\""}}\n</tool_call>',
+    [["shell", { command: 'echo "<|DSML|invoke"' }]]);
+
+  // Still refused: these need a retry.
+  expectNoCall("arguments string that is not JSON",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">cd /r && ls</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("flat keys the tool does not declare", '<tool_call>{"name":"shell","cmd":"ls"}</tool_call>');
+  expectNoCall("<tool_call> with an unclosed half-DSML tag", "<tool_call>\n<｜DSML");
+
+  // A tool that declares "arguments" as a string keeps the text.
+  const stringArgsTool = {
+    name: "run",
+    parameters: { type: "object", properties: { arguments: { type: "string" } }, required: ["arguments"] },
+  };
+  const declared = parseToolCalls(
+    '<|DSML|invoke name="run"><|DSML|parameter name="arguments" string="true">{"a":1}</|DSML|parameter></|DSML|invoke>',
+    [stringArgsTool],
+  );
+  ok("declared string arguments parameter kept as text",
+    declared.toolCalls[0] && args(declared.toolCalls[0]).arguments === '{"a":1}');
+}
+
 async function main() {
   testParser();
   testStreamingParser();
@@ -1929,6 +2040,7 @@ async function main() {
   testDollarPatterns();
   testTrailingNewlines();
   testDsml();
+  testLiveDeepseekShapes();
   testOpencodeFixture();
   testCheckHelpers();
   await testRunToolEmulation();

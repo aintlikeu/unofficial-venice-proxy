@@ -412,14 +412,19 @@ How it works:
      name sits next to it. The model sometimes glues the value to the name with a colon and
      leaves out the `>`: `<|DSML|parameter name="arguments":{"path":"a.js",…}}</|DSML|parameter>`.
      That value is read as the JSON at its start (a stray trailing `}` is ignored), and a `>`
-     inside it (an arrow function, say) is not taken for the end of the tag.
+     inside it (an arrow function, say) is not taken for the end of the tag. The `arguments`
+     object may also come as JSON text in a `string="true"` parameter; it is parsed unless
+     the tool declares an `arguments` parameter of its own. A DSML invoke written inside
+     `<tool_call>` or `<proxy_call>` (closed or not) is parsed as DSML.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
    but if its last value never closed it was truncated: it counts as unparsed (and is
    retried) rather than writing half a file.
    Fences inside the tags, `arguments` given as a string, and `parameters` instead of
-   `arguments` are accepted. A reply that is nothing but a JSON call object (bare or in one
+   `arguments` are accepted. When `arguments` is missing or empty, keys next to `name` that
+   the tool's schema declares are taken as the arguments
+   (`{"name":"shell","command":"ls","arguments":{}}`); undeclared keys are dropped. A reply that is nothing but a JSON call object (bare or in one
    fenced block) naming a known tool is accepted too. A call that misses an argument the
    tool's schema marks as `required` is treated as unparsed.
 4. Streaming sends text as it arrives and holds back only what could be the start of a

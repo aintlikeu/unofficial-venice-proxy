@@ -104,12 +104,13 @@ const DSML_XML_INVOKE = "<|DSML|invoke";
 const DSML_XML_INVOKE_END = "</|DSML|invoke>";
 const DSML_XML_PARAMETER = "<|DSML|parameter";
 const DSML_XML_PARAMETER_END = "</|DSML|parameter>";
+const DSML_XML_INVOKE_VARIANTS = pipeVariants(DSML_XML_INVOKE);
 const DSML_XML_INVOKE_END_VARIANTS = pipeVariants(DSML_XML_INVOKE_END);
 const DSML_XML_PARAMETER_VARIANTS = pipeVariants(DSML_XML_PARAMETER);
 const DSML_XML_PARAMETER_END_VARIANTS = pipeVariants(DSML_XML_PARAMETER_END);
 DSML_NOISE.push(...pipeVariants(DSML_XML_CALLS_BEGIN), ...pipeVariants(DSML_XML_CALLS_END));
 CALL_TAGS.push(
-  ...pipeVariants(DSML_XML_INVOKE).map((open) => ({
+  ...DSML_XML_INVOKE_VARIANTS.map((open) => ({
     open,
     close: DSML_XML_INVOKE_END_VARIANTS,
     wrapper: true,
@@ -984,7 +985,28 @@ function parseJsonCall(body, tools) {
   if (!tool) {
     return { error: `unknown tool "${call.name}"` };
   }
-  return parseJsonArgs(tool, call.arguments ?? call.parameters);
+  const args = call.arguments ?? call.parameters;
+  return parseJsonArgs(tool, isEmptyArgs(args) ? (flatArgs(call, tool) ?? args) : args);
+}
+
+function isEmptyArgs(value) {
+  return value === undefined || value === null || (typeof value === "string" && !value.trim()) ||
+    (isPlainObject(value) && Object.keys(value).length === 0);
+}
+
+// Arguments written next to "name" instead of inside "arguments", seen live
+// from DeepSeek: {"name":"edit","path":…,"oldString":…} or
+// {"command":…,"name":"shell","arguments":{}}. Only keys the tool declares
+// count; null when there are none.
+function flatArgs(call, tool) {
+  const declared = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
+  const args = {};
+  for (const [key, value] of Object.entries(call)) {
+    if (!["name", "arguments", "parameters"].includes(key) && Object.hasOwn(declared, key)) {
+      args[key] = value;
+    }
+  }
+  return Object.keys(args).length > 0 ? args : null;
 }
 
 // A key tag that runs straight into JSON, as models do when they drift from
@@ -1238,6 +1260,13 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   // (the {"name", "arguments"} call object split into parameters). Unwrap it
   // unless the tool really declares those names.
   const declared = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
+  // The wrapped object also comes marked string="true", i.e. as JSON text.
+  if (typeof parsedArgs.arguments === "string" && !Object.hasOwn(declared, "arguments")) {
+    const parsed = parseJsonLenient(parsedArgs.arguments.trim(), { whole: true })?.value;
+    if (isPlainObject(parsed)) {
+      parsedArgs.arguments = parsed;
+    }
+  }
   const extraKeys = Object.keys(parsedArgs).filter((key) => key !== "arguments");
   const nameEchoesTool =
     extraKeys.length === 1 &&
@@ -1556,7 +1585,23 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
         continue;
       }
 
-      // mode === "tag"; a bare <function=…> block keeps its tag in the body.
+      // mode === "tag". DeepSeek sometimes opens <tool_call> and then writes a
+      // DSML invoke inside it, often without </tool_call>: the wrapper is
+      // dropped and the invoke parsed as DSML (a stray </tool_call> after it
+      // is skipped like any wrapper closer after a call).
+      if (currentTag.wrapper && !currentTag.complete && !currentTag.dynamic) {
+        const inner = buffer.trimStart();
+        if (DSML_XML_INVOKE_VARIANTS.some((open) => inner.startsWith(open))) {
+          buffer = inner;
+          openTagText = "";
+          mode = "text";
+          continue;
+        }
+        if (inner && DSML_XML_INVOKE_VARIANTS.some((open) => open.startsWith(inner))) {
+          return;
+        }
+      }
+      // A bare <function=…> block keeps its tag in the body.
       const closes = [].concat(currentTag.close);
       let closeIndex = -1;
       let closeToken = closes[0];
