@@ -2009,10 +2009,59 @@ function testLiveDeepseekShapes() {
     '<tool_call>\n{"name":"shell","arguments":{"command":"echo \\"<|DSML|invoke\\""}}\n</tool_call>',
     [["shell", { command: 'echo "<|DSML|invoke"' }]]);
 
+  // 4. The bare value in the "arguments" parameter: it goes to the only
+  // required parameter when that one is a string.
+  const lsSed = "cd /root/p && wc -l *.py | sort -n | tail -20; echo '--- x ---'; sed -n 1,40p re.py";
+  expectCalls("DSML arguments holding the bare command",
+    `<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">${lsSed}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: lsSed }]]);
+  const multiline = 'cd /root/p && D=$(mktemp -d)\necho "--- resume"\npython3 -c "\nimport os\nprint(1)\n"';
+  expectCalls("DSML arguments holding a multi-line command, with text before",
+    `Проверю флаг.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">${multiline}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: multiline }]], { content: "Проверю флаг." });
+  expectCalls("DSML arguments holding the bare command next to a name parameter",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="name" string="true">shell</｜DSML｜ parameter></｜DSML｜ invoke>',
+    [["shell", { command: "ls" }]]);
+  expectCalls("JSON call followed by a DSML call with a bare command",
+    `Проверю.\n\n<tool_call>{"name":"shell","arguments":{"command":"python3 probe.py | tail -15"}}</tool_call>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">strings $P/claude | grep -oE 'claude-[0-9a-z-]*' | sort -u</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: "python3 probe.py | tail -15" }], ["shell", { command: "strings $P/claude | grep -oE 'claude-[0-9a-z-]*' | sort -u" }]],
+    { content: "Проверю." });
+
+  // 5. The argument object written straight into the invoke.
+  const heredoc = "cd /root/p && python3 - <<'PY'\nimport subprocess\nprint(\"x\")\nPY";
+  expectCalls("JSON object inside the invoke, with a stray parameter close",
+    `Проверю формы вызова.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">${JSON.stringify({ command: heredoc })}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: heredoc }]], { content: "Проверю формы вызова." });
+  expectCalls("JSON object inside the invoke, no closing junk",
+    '<｜DSML｜ invoke name="shell">\n{"command":"ls","timeout":5}\n</｜DSML｜ invoke>',
+    [["shell", { command: "ls", timeout: 5 }]]);
+  expectCalls("JSON call object inside the invoke",
+    '<｜DSML｜ invoke name="shell">{"name":"shell","arguments":{"command":"ls"}}</｜DSML｜ invoke>',
+    [["shell", { command: "ls" }]]);
+
   // Still refused: these need a retry.
-  expectNoCall("arguments string that is not JSON",
-    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">cd /r && ls</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("bare arguments for a tool with several required parameters",
+    '<｜DSML｜ invoke name="edit"><｜DSML｜ parameter name="arguments" string="true">/r/a.py</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("bare arguments that are broken JSON",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">{"command": "ls</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("bare arguments next to another parameter",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="timeout">5</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("bare arguments cut off by the end of the stream",
+    '<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">rm -rf /tmp/build && mk');
+  expectNoCall("JSON inside the invoke followed by text",
+    '<｜DSML｜ invoke name="shell">{"command":"ls"} and then more</｜DSML｜ invoke>');
+  expectNoCall("broken JSON inside the invoke",
+    '<｜DSML｜ invoke name="shell">{"command":"echo "hi""}</｜DSML｜ invoke>');
   expectNoCall("flat keys the tool does not declare", '<tool_call>{"name":"shell","cmd":"ls"}</tool_call>');
+  const countTool = {
+    name: "count",
+    parameters: { type: "object", properties: { n: { type: "integer" } }, required: ["n"] },
+  };
+  const numeric = parseToolCalls(
+    '<|DSML|invoke name="count"><|DSML|parameter name="arguments" string="true">five</|DSML|parameter></|DSML|invoke>',
+    [countTool],
+  );
+  ok("bare arguments not given to a non-string parameter", numeric.toolCalls.length === 0);
   expectNoCall("<tool_call> with an unclosed half-DSML tag", "<tool_call>\n<｜DSML");
 
   // A tool that declares "arguments" as a string keeps the text.

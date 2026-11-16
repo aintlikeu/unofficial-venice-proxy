@@ -1206,6 +1206,7 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   }
   const source = String(body);
   const parsedArgs = {};
+  const cutOff = new Set();
   let found = false;
   let cursor = 0;
   for (;;) {
@@ -1240,6 +1241,7 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
       if (!terminated) {
         if (key) {
           parsedArgs[key] = parseDsmlParameterValue(attributes, source.slice(valueStart), tool, key);
+          cutOff.add(key);
           found = true;
         }
         break;
@@ -1252,8 +1254,15 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
     }
     cursor = valueEnd.index + valueEnd.token.length;
   }
-  if (!found && source.replace(/\s+/g, " ").trim()) {
-    return { error: `unrecognized arguments for "${tool.name}"` };
+  if (!found && source.trim()) {
+    // The argument object written straight into the invoke, with no parameter
+    // tags (seen live): <|DSML|invoke name="shell">{"command":…}</|DSML|parameter>.
+    // Only closing tags may follow it.
+    const object = dsmlInvokeJsonBody(source);
+    if (!object) {
+      return { error: `unrecognized arguments for "${tool.name}"` };
+    }
+    Object.assign(parsedArgs, object);
   }
   // Some builds wrap the whole argument object in one parameter named
   // "arguments", sometimes next to a "name" parameter repeating the tool name
@@ -1283,7 +1292,49 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   if (extraKeys.includes("name") && !Object.hasOwn(declared, "name") && isPlainObject(parsedArgs.arguments)) {
     return { error: `"name" parameter "${parsedArgs.name}" does not match tool "${tool.name}"` };
   }
+  // Or the "arguments" parameter holds the bare value instead of an object
+  // (seen live): <|DSML|parameter name="arguments" string="true">cd … && ls</…>.
+  // It goes to the tool's only required parameter, when that one is a string;
+  // never when the value was cut off by the end of the stream, or looks like
+  // a JSON object that failed to parse.
+  const sole = soleRequiredStringParameter(tool);
+  if (
+    typeof parsedArgs.arguments === "string" &&
+    !Object.hasOwn(declared, "arguments") &&
+    (extraKeys.length === 0 || nameEchoesTool) &&
+    sole &&
+    !cutOff.has("arguments") &&
+    parsedArgs.arguments.trim() &&
+    !/^\s*[{[]/.test(parsedArgs.arguments)
+  ) {
+    return buildToolCall(tool, { [sole]: parsedArgs.arguments });
+  }
   return buildToolCall(tool, parsedArgs);
+}
+
+// The tool's only required parameter, when it is typed as a string; else null.
+function soleRequiredStringParameter(tool) {
+  const required = Array.isArray(tool.parameters?.required) ? tool.parameters.required : [];
+  if (required.length !== 1) {
+    return null;
+  }
+  const types = schemaTypes(tool.parameters?.properties?.[required[0]]);
+  return types.includes("string") ? required[0] : null;
+}
+
+// A JSON object at the start of an invoke body followed by nothing but
+// closing tags, or null.
+function dsmlInvokeJsonBody(source) {
+  const trimmed = source.trimStart();
+  if (!trimmed.startsWith("{")) {
+    return null;
+  }
+  const text = extractJsonObject(trimmed);
+  if (!text || !/^(?:\s*<\s*\/[^<>]*>?)*\s*$/.test(trimmed.slice(text.length))) {
+    return null;
+  }
+  const parsed = parseJsonLenient(text, { whole: true })?.value;
+  return isPlainObject(parsed) ? parsed : null;
 }
 
 // DSML writes "function<|tool▁sep|>NAME" (sometimes just "<|tool▁sep|>NAME" or

@@ -414,8 +414,15 @@ How it works:
      That value is read as the JSON at its start (a stray trailing `}` is ignored), and a `>`
      inside it (an arrow function, say) is not taken for the end of the tag. The `arguments`
      object may also come as JSON text in a `string="true"` parameter; it is parsed unless
-     the tool declares an `arguments` parameter of its own. A DSML invoke written inside
-     `<tool_call>` or `<proxy_call>` (closed or not) is parsed as DSML.
+     the tool declares an `arguments` parameter of its own. When that text is not JSON but
+     the bare value (`<|DSML|parameter name="arguments" string="true">cd src && ls</…>`),
+     it goes to the tool's only required parameter if that one is a string (`command` for a
+     shell tool); a tool with several required parameters, a value cut off by the end of
+     the stream or one that looks like broken JSON still gets a retry. An argument object
+     written straight into the invoke, without parameter tags
+     (`<|DSML|invoke name="shell">{"command":"ls"}</|DSML|invoke>`), is parsed when only
+     closing tags follow it. A DSML invoke written inside `<tool_call>` or `<proxy_call>`
+     (closed or not) is parsed as DSML.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,

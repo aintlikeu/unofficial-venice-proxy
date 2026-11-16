@@ -2156,6 +2156,9 @@ export function createVeniceOpenAiProxyServer(
         logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
         return;
       }
+      console.warn(
+        `[${nowIso()}] request failed: ${req.method} ${url.pathname} ${error instanceof Error ? error.message : String(error)}`,
+      );
       json(res, 500, {
         error: {
           message: error instanceof Error ? error.message : String(error),
