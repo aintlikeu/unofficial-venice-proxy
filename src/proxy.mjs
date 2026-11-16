@@ -1283,7 +1283,10 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
   const runStats = {};
   const events = runToolEmulation({
     emulation: toolEmulation,
-    openAttempt: (messages) => chatAttemptEvents(proxy, payload, toolEmulation, messages, stats),
+    // The retry after a reasoning overrun goes with reasoning off (Venice's
+    // flag plus the /no_think prefix, as for a request that asks for it).
+    openAttempt: (messages, { reasoning } = {}) =>
+      chatAttemptEvents(proxy, reasoning === false ? { ...payload, reasoning: false } : payload, toolEmulation, messages, stats),
     onEvent: (event) => logToolEmulationEvent(event, model),
     stats: runStats,
     reasoningBudget: TOOL_REASONING_BUDGET,

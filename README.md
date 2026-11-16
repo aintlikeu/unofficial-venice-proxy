@@ -417,8 +417,10 @@ How it works:
      the tool declares an `arguments` parameter of its own. When that text is not JSON but
      the bare value (`<|DSML|parameter name="arguments" string="true">cd src && ls</…>`),
      it goes to the tool's only required parameter if that one is a string (`command` for a
-     shell tool); a tool with several required parameters, a value cut off by the end of
-     the stream or one that looks like broken JSON still gets a retry. An argument object
+     shell tool). Other parameters the tool declares may come next to it (`workdir`, say)
+     and are kept; a tool with several required parameters, an undeclared parameter next to
+     it, a value cut off by the end of the stream or one that looks like broken JSON still
+     gets a retry. An argument object
      written straight into the invoke, without parameter tags
      (`<|DSML|invoke name="shell">{"command":"ls"}</|DSML|invoke>`), is parsed when only
      closing tags follow it. A DSML invoke written inside `<tool_call>` or `<proxy_call>`
@@ -458,8 +460,11 @@ and keeps only the first.
 Reasoning has a budget while tools are emulated. If a reply streams more than
 `VENICE_TOOL_REASONING_BUDGET` characters of reasoning (default `32000`, `0` turns it off)
 before any answer text or call, the proxy cancels that upstream request. It retries once with
-a note asking the model to keep its reasoning brief. If the retry runs over too, the client
-gets an error instead of waiting for Venice's five-minute upstream timeout:
+reasoning off (`reasoning: false` and the `/no_think` prefix, as for a request that asks for
+it) and a note asking the model to keep its reasoning brief. The note alone did not stop
+`deepseek-v4-1-flash-uncensored`, which now and then overran twice in a row; with reasoning
+off it answers, sometimes thinking aloud in the reply text first. If the retry still runs over,
+the client gets an error instead of waiting for Venice's five-minute upstream timeout:
 - non-streaming: HTTP 504 with `code: "reasoning_budget_exceeded"`. SDK clients retry a 504
   up to twice, which in live runs sometimes got an answer.
 - streaming: an OpenAI-style `{"error": …}` chunk followed by `[DONE]`. Its type is

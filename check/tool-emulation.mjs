@@ -1000,9 +1000,9 @@ function testCheckHelpers() {
 // records how far it was read and whether it was closed early.
 function scriptedUpstream(attempts) {
   const log = [];
-  const open = (messages) => {
+  const open = (messages, options) => {
     const script = attempts[log.length] ?? [];
-    const entry = { messages, read: 0, closedEarly: false };
+    const entry = { messages, options, read: 0, closedEarly: false };
     log.push(entry);
     return (async function* () {
       let finished = false;
@@ -1178,6 +1178,9 @@ async function testReasoningBudget() {
     recovered.stats.attempts === 2 && recovered.upstream[1].messages.at(-1).content.endsWith(
       "[Keep your reasoning brief: answer or call a tool right away.]"));
   ok("overrun: the retry's text and call are returned", recovered.text === "Here:" && recovered.calls.length === 1);
+  ok("overrun: the retry asks for reasoning off, the first attempt does not",
+    !recovered.upstream[0].options?.reasoning && recovered.upstream[0].options?.reasoning !== false &&
+      recovered.upstream[1].options?.reasoning === false);
   ok("overrun: logged", recovered.reports[0]?.type === "overrun" && /passed 1000 characters/.test(recovered.reports[0].reason));
   ok("overrun: reasoning before the cut was streamed", recovered.events.filter((event) => event.type === "reasoning").length >= 2);
 
@@ -1201,6 +1204,7 @@ async function testReasoningBudget() {
   ok("budget 0: no limit", unlimited.calls.length === 1 && unlimited.stats.attempts === 1);
   const bad = '<proxy_call>{"name": "get_weather", "arguments": </proxy_call>';
   const badThenLoop = await collect(emulation, [[bad], loop], budget);
+  ok("an unparsed-call retry keeps reasoning on", badThenLoop.upstream[1].options?.reasoning !== false);
   ok("unparsed call, then an overrun: the original block comes back as text",
     badThenLoop.text === bad && !badThenLoop.events.some((event) => event.type === "error"));
 }
@@ -1320,8 +1324,10 @@ async function testProxyWiring() {
       text: chatEvents.filter((event) => event.kind === "content").map((event) => event.content ?? "").join(""),
     };
   };
+  const chatStreamCalls = [];
   const stubChatStream = async (_jwt, _input, options) => {
     upstream = options;
+    chatStreamCalls.push(options);
     chatStreamRead = 0;
     chatStreamClosedEarly = false;
     return {
@@ -1515,7 +1521,15 @@ async function testProxyWiring() {
       { kind: "content", content: "never reached" },
     ];
     logs.length = 0;
+    chatStreamCalls.length = 0;
     const overrunJson = await post({ model: "qwen-3-8-27b", messages: history, tools: [WEATHER_TOOL] });
+    const lastUser = (options) => options.promptMessages.findLast((message) => message.role === "user").content;
+    ok("budget: the retry goes with reasoning off and /no_think, the first attempt did not",
+      chatStreamCalls.length === 2 && chatStreamCalls[0].reasoning === true && !lastUser(chatStreamCalls[0]).startsWith("/no_think ") &&
+        chatStreamCalls[1].reasoning === false && lastUser(chatStreamCalls[1]).startsWith("/no_think "),
+      chatStreamCalls.map((options) => `${options.reasoning} ${JSON.stringify(lastUser(options).slice(0, 20))}`).join(" | "));
+    ok("budget: the retry's translation logged with reasoning off",
+      logs.filter((line) => line.includes(" translate ")).map((line) => /reasoning=(\w+)/.exec(line)?.[1]).join(",") === "true,false");
     const overrunError = JSON.parse(overrunJson.text).error;
     ok("budget, non-stream: 504 reasoning_budget_exceeded",
       overrunJson.status === 504 && overrunError?.code === "reasoning_budget_exceeded" && overrunError?.type === "server_error");
@@ -1926,7 +1940,7 @@ function testLiveDeepseekShapes() {
     name: "shell",
     parameters: {
       type: "object",
-      properties: { command: { type: "string" }, timeout: { type: "number" }, description: { type: "string" } },
+      properties: { command: { type: "string" }, timeout: { type: "number" }, workdir: { type: "string" }, description: { type: "string" } },
       required: ["command"],
     },
   };
@@ -2027,6 +2041,18 @@ function testLiveDeepseekShapes() {
     [["shell", { command: "python3 probe.py | tail -15" }], ["shell", { command: "strings $P/claude | grep -oE 'claude-[0-9a-z-]*' | sort -u" }]],
     { content: "Проверю." });
 
+  // Seen live: a declared parameter next to the bare command.
+  const status = "cd /root/p && git status -sb | head -2 && git log --oneline -1";
+  expectCalls("DSML arguments holding the bare command next to workdir",
+    `Шаг 3 закрыт. Проверю пуш.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">${status}</｜DSML｜ parameter>\n<｜DSML｜ parameter name="workdir" string="true">/root/p</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { workdir: "/root/p", command: status }]], { content: "Шаг 3 закрыт. Проверю пуш." });
+  expectCalls("DSML arguments holding the bare command next to a typed parameter",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="timeout">5</｜DSML｜ parameter></｜DSML｜ invoke>',
+    [["shell", { timeout: 5, command: "ls" }]]);
+  expectCalls("DSML arguments holding the bare command next to workdir and a name parameter",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="name" string="true">shell</｜DSML｜ parameter><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="workdir" string="true">/r</｜DSML｜ parameter></｜DSML｜ invoke>',
+    [["shell", { workdir: "/r", command: "ls" }]]);
+
   // 5. The argument object written straight into the invoke.
   const heredoc = "cd /root/p && python3 - <<'PY'\nimport subprocess\nprint(\"x\")\nPY";
   expectCalls("JSON object inside the invoke, with a stray parameter close",
@@ -2044,8 +2070,14 @@ function testLiveDeepseekShapes() {
     '<｜DSML｜ invoke name="edit"><｜DSML｜ parameter name="arguments" string="true">/r/a.py</｜DSML｜ parameter></｜DSML｜ invoke>');
   expectNoCall("bare arguments that are broken JSON",
     '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">{"command": "ls</｜DSML｜ parameter></｜DSML｜ invoke>');
-  expectNoCall("bare arguments next to another parameter",
-    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="timeout">5</｜DSML｜ parameter></｜DSML｜ invoke>');
+  expectNoCall("bare arguments next to an undeclared parameter",
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="cwd" string="true">/r</｜DSML｜ parameter></｜DSML｜ invoke>');
+  const explicit = parseToolCalls(
+    '<｜DSML｜ invoke name="shell"><｜DSML｜ parameter name="arguments" string="true">ls</｜DSML｜ parameter><｜DSML｜ parameter name="command" string="true">pwd</｜DSML｜ parameter></｜DSML｜ invoke>',
+    tools,
+  );
+  ok("bare arguments never replace an explicit command",
+    explicit.toolCalls.length === 1 && args(explicit.toolCalls[0]).command === "pwd");
   expectNoCall("bare arguments cut off by the end of the stream",
     '<｜DSML｜ calls>\n<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="arguments" string="true">rm -rf /tmp/build && mk');
   expectNoCall("JSON inside the invoke followed by text",

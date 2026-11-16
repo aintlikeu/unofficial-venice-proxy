@@ -1296,18 +1296,24 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   // (seen live): <|DSML|parameter name="arguments" string="true">cd … && ls</…>.
   // It goes to the tool's only required parameter, when that one is a string;
   // never when the value was cut off by the end of the stream, or looks like
-  // a JSON object that failed to parse.
+  // a JSON object that failed to parse. Other parameters may sit next to it
+  // (seen live: workdir) if the tool declares them and none is that required
+  // one; a "name" repeating the tool name is dropped.
   const sole = soleRequiredStringParameter(tool);
+  const otherKeys = extraKeys.filter(
+    (key) => !(key === "name" && !Object.hasOwn(declared, "name") && String(parsedArgs.name).trim() === tool.name),
+  );
   if (
     typeof parsedArgs.arguments === "string" &&
     !Object.hasOwn(declared, "arguments") &&
-    (extraKeys.length === 0 || nameEchoesTool) &&
     sole &&
+    otherKeys.every((key) => key !== sole && Object.hasOwn(declared, key)) &&
     !cutOff.has("arguments") &&
     parsedArgs.arguments.trim() &&
     !/^\s*[{[]/.test(parsedArgs.arguments)
   ) {
-    return buildToolCall(tool, { [sole]: parsedArgs.arguments });
+    const rest = Object.fromEntries(otherKeys.map((key) => [key, parsedArgs[key]]));
+    return buildToolCall(tool, { ...rest, [sole]: parsedArgs.arguments });
   }
   return buildToolCall(tool, parsedArgs);
 }
@@ -1853,7 +1859,10 @@ export function buildEmptyRetryMessages(emulation) {
 //   too the original block comes back as text;
 // - a reasoning overrun: more than reasoningBudget characters of reasoning
 //   before any answer text or call. The request is cancelled and asked again
-//   with a nudge to be brief; if that overruns as well, an "error" event ends
+//   with a nudge to be brief and with reasoning off (openAttempt gets
+//   { reasoning: false }): a nudge alone did not stop deepseek-v4-1-flash-
+//   uncensored, which overran twice in a row now and then, and opencode
+//   stopped on the error. If that overruns as well, an "error" event ends
 //   the reply instead of waiting for the upstream timeout.
 // onEvent reports "retry", "overrun", "failed" and "dropped" for logging.
 export async function* runToolEmulation({
@@ -1866,6 +1875,7 @@ export async function* runToolEmulation({
   stats.attempts = 0;
   stats.toolCalls = 0;
   let messages = emulation.messages;
+  let attemptOptions = {};
   let firstFailure = null;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1916,7 +1926,7 @@ export async function* runToolEmulation({
       return visible;
     };
 
-    for await (const event of openAttempt(messages)) {
+    for await (const event of openAttempt(messages, attemptOptions)) {
       if (event.type === "content") {
         output += event.text;
         answerStarted ||= event.text.trim() !== "";
@@ -1974,6 +1984,7 @@ export async function* runToolEmulation({
       if (failure.overrun) {
         onEvent({ type: "overrun", reason: failure.reason, outputs: [] });
         messages = buildOverrunRetryMessages(emulation);
+        attemptOptions = { reasoning: false };
       } else if (failure.empty) {
         onEvent({ type: "empty", reason: failure.reason, outputs: [] });
         messages = buildEmptyRetryMessages(emulation);
