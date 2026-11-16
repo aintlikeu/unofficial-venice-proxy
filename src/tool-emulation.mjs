@@ -119,6 +119,17 @@ CALL_TAGS.push(
 );
 const SNIPPET_MAX_CHARS = 200;
 
+// After a call only another call may follow. Whitespace, stray closing tags
+// and DSML block markers are skipped while waiting for one, so a model that
+// loops on them kept the reply open until Venice's output cap: four times
+// live (deepseek-v4-1-flash-uncensored, 2026-11-15/16) the call reached the
+// client within seconds, then ~425K characters followed for about four
+// minutes, the client could not run the call until the stream ended, and the
+// estimated output (~120K tokens) made opencode compact for no reason. Past
+// this many characters with no new call the reply ends. The gap between two
+// real calls is a few characters of markup.
+const TRAILING_JUNK_LIMIT = 2000;
+
 export function parseToolEmulationSetting(value) {
   if (typeof value !== "string") {
     return true;
@@ -1485,6 +1496,10 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
   let currentTag = CALL_TAGS[0];
   let toolCallCount = 0;
   let stopped = false;
+  // Raw text since the last call while no other call has started, and its
+  // start for the log; see TRAILING_JUNK_LIMIT.
+  let sinceCall = 0;
+  let sinceCallSample = "";
   // Trailing whitespace is held back so a call-only reply streams no stray
   // newlines; it is flushed with the next text or at the end.
   let pendingWhitespace = "";
@@ -1510,15 +1525,17 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
     pendingWhitespace = "";
   };
 
-  const stop = () => {
+  const stop = (extra = {}) => {
     stopped = true;
     buffer = "";
-    events.push({ type: "stop" });
+    events.push({ type: "stop", ...extra });
   };
 
   const emitCall = (result, raw) => {
     if (result.toolCall) {
       toolCallCount += 1;
+      sinceCall = 0;
+      sinceCallSample = "";
       events.push({ type: "tool_call", toolCall: result.toolCall });
       if (toolCallCount >= maxCalls) {
         stop();
@@ -1696,8 +1713,22 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
 
     push(text) {
       if (!stopped && typeof text === "string" && text) {
+        const callsBefore = toolCallCount;
         buffer += noise.push(text);
         scan();
+        if (mode === "tag" || toolCallCount === 0) {
+          sinceCall = 0;
+          sinceCallSample = "";
+        } else if (!stopped && toolCallCount === callsBefore) {
+          // Counted from the chunk after the one that finished the call.
+          sinceCall += text.length;
+          if (sinceCallSample.length < SNIPPET_MAX_CHARS) {
+            sinceCallSample += text.slice(0, SNIPPET_MAX_CHARS - sinceCallSample.length);
+          }
+          if (sinceCall > TRAILING_JUNK_LIMIT) {
+            stop({ reason: `${sinceCall} characters after the last call without another call`, sample: sinceCallSample });
+          }
+        }
       }
       return drain();
     },
@@ -1864,7 +1895,8 @@ export function buildEmptyRetryMessages(emulation) {
 //   uncensored, which overran twice in a row now and then, and opencode
 //   stopped on the error. If that overruns as well, an "error" event ends
 //   the reply instead of waiting for the upstream timeout.
-// onEvent reports "retry", "overrun", "failed" and "dropped" for logging.
+// onEvent reports "retry", "overrun", "failed", "dropped" and "trailing" (a
+// reply cut short after its calls, see TRAILING_JUNK_LIMIT) for logging.
 export async function* runToolEmulation({
   emulation,
   openAttempt,
@@ -1913,6 +1945,9 @@ export async function* runToolEmulation({
           stats.toolCalls += 1;
           visible.push(event);
         } else if (event.type === "stop") {
+          if (event.reason) {
+            onEvent({ type: "trailing", reason: event.reason, outputs: [event.sample ?? ""] });
+          }
           finished = true;
         } else if (event.type === "invalid") {
           if (stats.toolCalls > 0) {

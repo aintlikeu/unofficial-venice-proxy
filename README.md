@@ -442,6 +442,12 @@ How it works:
 5. Once the reply is complete the proxy stops reading and cancels the upstream request: right
    after a call when `parallel_tool_calls` is `false`, otherwise as soon as anything other than
    another `<tool_call>` follows a call. The model cannot go on with "Let me fix that".
+   Whitespace, stray closing tags and DSML block markers are skipped while waiting for
+   another call, but only for 2,000 characters: `deepseek-v4-1-flash-uncensored` sometimes
+   looped on such filler after its call until Venice's output cap (~425K characters, about
+   four minutes), and the client could not run the call until the stream ended. Past that the
+   reply ends and the proxy logs `stopped reading after the calls` with the start of the
+   filler.
 6. A block that cannot be parsed is never sent to the client. If no call has been returned
    yet, the proxy cancels that upstream request and retries once. The raw reply goes back to
    the model with a one-line correction in its format, and the retry's call is returned (any

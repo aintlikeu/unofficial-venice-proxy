@@ -1544,6 +1544,20 @@ async function testProxyWiring() {
         overrunStream.at(-2)?.error?.type === "invalid_request_error" && overrunStream.at(-1) === "[DONE]" &&
         !overrunStream.some((chunk) => chunk.choices?.[0]?.finish_reason));
 
+    // Junk after the call: the reply ends, the upstream is cancelled, it is logged.
+    chatEvents = [
+      { kind: "meta", servingModelId: "qwen-serving" },
+      { kind: "content", content: '<proxy_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</proxy_call>' },
+      ...Array.from({ length: 200 }, () => ({ kind: "content", content: "\n".repeat(50) })),
+    ];
+    logs.length = 0;
+    const trailing = await post({ model: "qwen-3-8-27b", messages: history, tools: [WEATHER_TOOL] });
+    const trailingCalls = JSON.parse(trailing.text).choices?.[0]?.message?.tool_calls ?? [];
+    ok("trailing junk: one call returned, upstream cancelled early, logged",
+      trailing.status === 200 && trailingCalls.length === 1 && chatStreamClosedEarly && chatStreamRead < 60 &&
+        logs.some((line) => line.includes("stopped reading after the calls") && line.includes("characters after the last call")),
+      `${trailing.status} calls=${trailingCalls.length} read=${chatStreamRead}`);
+
     // An empty reply is retried; the client gets the retry's call.
     for (const stream of [false, true]) {
       let attempt = 0;
@@ -2109,6 +2123,72 @@ function testLiveDeepseekShapes() {
     declared.toolCalls[0] && args(declared.toolCalls[0]).arguments === '{"a":1}');
 }
 
+async function testTrailingJunk() {
+  section("trailing junk after the calls");
+  const tools = normalizeTools([WEATHER_TOOL]);
+  const call = '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>';
+  const stream = (text, chunk = 1) => {
+    const parser = createToolCallParser(tools);
+    const events = [];
+    let consumed = 0;
+    for (let at = 0; at < text.length; at += chunk) {
+      const piece = text.slice(at, at + chunk);
+      const out = parser.push(piece);
+      events.push(...out);
+      consumed = at + piece.length;
+      if (out.some((event) => event.type === "stop")) {
+        break;
+      }
+    }
+    events.push(...parser.end());
+    return {
+      calls: events.filter((event) => event.type === "tool_call"),
+      stop: events.find((event) => event.type === "stop"),
+      consumed,
+    };
+  };
+
+  for (const [label, junk] of [
+    ["newlines", "\n".repeat(50_000)],
+    ["stray </tool_call> closers", "</tool_call>\n".repeat(5000)],
+    ["DSML block markers", "</｜DSML｜ calls>\n".repeat(5000)],
+  ]) {
+    const result = stream(`Checking.\n\n${call}${junk}`, 7);
+    ok(`trailing ${label}: the call is kept and reading stops soon after the limit`,
+      result.calls.length === 1 && /characters after the last call/.test(result.stop?.reason ?? "") &&
+        result.consumed < `Checking.\n\n${call}`.length + 2100,
+      `calls=${result.calls.length} consumed=${result.consumed} reason=${result.stop?.reason}`);
+  }
+  const sample = stream(`${call}${"</tool_call>\n".repeat(500)}`, 5).stop?.sample ?? "";
+  ok("trailing junk: a sample is kept for the log", sample.includes("tool_call>\n</tool_call>") && sample.length <= 200, JSON.stringify(sample));
+
+  const two = stream(`${call}${"\n".repeat(1500)}${call}`, 3);
+  ok("a second call after a gap under the limit is still parsed", two.calls.length === 2 && !two.stop?.reason);
+  const big = "x".repeat(20_000);
+  const longSecond = stream(`${call}\n<tool_call>{"name":"get_weather","arguments":{"city":"${big}"}}</tool_call>`, 11);
+  ok("a long second call is not cut by the limit",
+    longSecond.calls.length === 2 && JSON.parse(longSecond.calls[1].toolCall.function.arguments).city === big);
+  const dsml = `<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n<｜DSML｜ parameter name="city" string="true">Oslo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n`;
+  const dsmlLoop = stream(`${dsml}${"</｜DSML｜ calls>\n".repeat(3000)}`, 4);
+  ok("DSML call followed by repeated block closers stops", dsmlLoop.calls.length === 1 && Boolean(dsmlLoop.stop?.reason));
+  const textOnly = stream("\n".repeat(10_000) + "Sunny.", 5);
+  ok("no call: whitespace is not limited", textOnly.calls.length === 0 && !textOnly.stop);
+
+  // The runner cancels the upstream request and reports it.
+  const emulation = resolveToolEmulation({
+    model: "deepseek-v4-1-flash-uncensored",
+    messages: [{ role: "user", content: "Weather in Paris?" }],
+    tools: [WEATHER_TOOL],
+  });
+  const junkChunks = Array.from({ length: 400 }, () => "\n".repeat(50));
+  const run = await collect(emulation, [["Checking. ", call, ...junkChunks]]);
+  ok("runner: the call is returned once", run.calls.length === 1 && run.stats.attempts === 1);
+  ok("runner: the upstream request is cancelled early",
+    run.upstream[0].closedEarly && run.upstream[0].read < 50, `read=${run.upstream[0].read}`);
+  ok("runner: reported as trailing with a sample",
+    run.reports.length === 1 && run.reports[0].type === "trailing" && run.reports[0].outputs[0].startsWith("\n"));
+}
+
 async function main() {
   testParser();
   testStreamingParser();
@@ -2122,6 +2202,7 @@ async function main() {
   testTrailingNewlines();
   testDsml();
   testLiveDeepseekShapes();
+  await testTrailingJunk();
   testOpencodeFixture();
   testCheckHelpers();
   await testRunToolEmulation();

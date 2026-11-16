@@ -286,7 +286,9 @@ function logToolEmulationEvent({ type, reason, outputs }, model) {
           ? "empty reply; retrying once with the format repeated"
           : type === "failed"
             ? "retry failed too"
-            : "ignoring an unparsed call after a valid one";
+            : type === "trailing"
+              ? "stopped reading after the calls"
+              : "ignoring an unparsed call after a valid one";
   const outputPart = outputs
     .map((output, index) => ` output${index + 1}=${JSON.stringify(truncateSnippet(output, TOOL_LOG_OUTPUT_MAX_CHARS))}`)
     .join("");
