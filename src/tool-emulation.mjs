@@ -1280,28 +1280,33 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   // (the {"name", "arguments"} call object split into parameters). Unwrap it
   // unless the tool really declares those names.
   const declared = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
-  // The wrapped object also comes marked string="true", i.e. as JSON text.
+  // The wrapped object also comes marked string="true", i.e. as JSON text, or
+  // with stray closing brackets after it (seen live: {…}} and {…}]).
   if (typeof parsedArgs.arguments === "string" && !Object.hasOwn(declared, "arguments")) {
-    const parsed = parseJsonLenient(parsedArgs.arguments.trim(), { whole: true })?.value;
-    if (isPlainObject(parsed)) {
+    const parsed = parseJsonObjectWithStrayClosers(parsedArgs.arguments);
+    if (parsed) {
       parsedArgs.arguments = parsed;
     }
   }
   const extraKeys = Object.keys(parsedArgs).filter((key) => key !== "arguments");
-  const nameEchoesTool =
-    extraKeys.length === 1 &&
-    extraKeys[0] === "name" &&
-    !Object.hasOwn(declared, "name") &&
-    String(parsedArgs.name).trim() === tool.name;
-  if (
-    isPlainObject(parsedArgs.arguments) &&
-    !Object.hasOwn(declared, "arguments") &&
-    (extraKeys.length === 0 || nameEchoesTool)
-  ) {
-    return buildToolCall(tool, parsedArgs.arguments);
-  }
-  if (extraKeys.includes("name") && !Object.hasOwn(declared, "name") && isPlainObject(parsedArgs.arguments)) {
-    return { error: `"name" parameter "${parsedArgs.name}" does not match tool "${tool.name}"` };
+  // A "name" repeating the tool name is dropped; a glued one may keep a quote.
+  const otherKeys = extraKeys.filter(
+    (key) =>
+      !(key === "name" && !Object.hasOwn(declared, "name") && String(parsedArgs.name).replace(/^\s*"|"\s*$/g, "").trim() === tool.name),
+  );
+  // Parameters the tool declares may sit next to the object (seen live:
+  // description, for a pwsh tool that requires it). A key in both places
+  // takes the object's value, as for flat JSON arguments. Siblings are not
+  // merged when a value was cut off by the end of the stream: a truncated
+  // newString would otherwise be written; the call then gets a retry.
+  if (isPlainObject(parsedArgs.arguments) && !Object.hasOwn(declared, "arguments")) {
+    if (otherKeys.every((key) => Object.hasOwn(declared, key)) && (otherKeys.length === 0 || cutOff.size === 0)) {
+      const siblings = Object.fromEntries(otherKeys.map((key) => [key, parsedArgs[key]]));
+      return buildToolCall(tool, { ...siblings, ...parsedArgs.arguments });
+    }
+    if (otherKeys.includes("name") && !Object.hasOwn(declared, "name")) {
+      return { error: `"name" parameter "${parsedArgs.name}" does not match tool "${tool.name}"` };
+    }
   }
   // Or the "arguments" parameter holds the bare value instead of an object
   // (seen live): <|DSML|parameter name="arguments" string="true">cd … && ls</…>.
@@ -1311,9 +1316,6 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   // (seen live: workdir) if the tool declares them and none is that required
   // one; a "name" repeating the tool name is dropped.
   const sole = soleRequiredStringParameter(tool);
-  const otherKeys = extraKeys.filter(
-    (key) => !(key === "name" && !Object.hasOwn(declared, "name") && String(parsedArgs.name).trim() === tool.name),
-  );
   if (
     typeof parsedArgs.arguments === "string" &&
     !Object.hasOwn(declared, "arguments") &&
@@ -1327,6 +1329,26 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
     return buildToolCall(tool, { ...rest, [sole]: parsedArgs.arguments });
   }
   return buildToolCall(tool, parsedArgs);
+}
+
+// A JSON object, also with nothing after it but closing brackets the model
+// added by mistake ("{…}}", "{…}]"); null for anything else. Stricter than
+// parseJsonLenient: other trailing text means the value is not this object.
+function parseJsonObjectWithStrayClosers(text) {
+  const trimmed = text.trim();
+  const whole = parseJsonLenient(trimmed, { whole: true })?.value;
+  if (isPlainObject(whole)) {
+    return whole;
+  }
+  if (!trimmed.startsWith("{")) {
+    return null;
+  }
+  const object = extractJsonObject(trimmed);
+  if (!object || !/^[\s}\]]*$/.test(trimmed.slice(object.length))) {
+    return null;
+  }
+  const parsed = parseJsonLenient(object, { whole: true })?.value;
+  return isPlainObject(parsed) ? parsed : null;
 }
 
 // The tool's only required parameter, when it is typed as a string; else null.

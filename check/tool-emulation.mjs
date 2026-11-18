@@ -1966,7 +1966,16 @@ function testLiveDeepseekShapes() {
       required: ["path", "oldString", "newString"],
     },
   };
-  const tools = [shellTool, editTool];
+  // A PowerShell tool as another client declares it: two required strings.
+  const pwshTool = {
+    name: "pwsh",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" }, description: { type: "string" }, timeout: { type: "number" } },
+      required: ["command", "description"],
+    },
+  };
+  const tools = [shellTool, editTool, pwshTool];
   const both = (text) => {
     const whole = parseToolCalls(text, tools);
     const parser = createToolCallParser(tools);
@@ -2078,6 +2087,48 @@ function testLiveDeepseekShapes() {
   expectCalls("JSON call object inside the invoke",
     '<｜DSML｜ invoke name="shell">{"name":"shell","arguments":{"command":"ls"}}</｜DSML｜ invoke>',
     [["shell", { command: "ls" }]]);
+
+  // 6. An argument object next to parameters the tool declares (seen live on
+  // pwsh, 2026-11-18: the reply came back to the client as text twice).
+  const psCommand = "$ErrorActionPreference='Continue'\n$c='C:\\Users\\a\\collector'\n\"=== observing_limited ===\"\nSelect-String -Path \"$c\\observer\\observer.py\" -Pattern '_observing_limited' -Encoding utf8 | ForEach-Object { \"{0}: {1}\" -f $_.LineNumber, $_.Line.Trim() }";
+  const pwshCall = (argumentsText, extra = "") =>
+    `\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="pwsh">\n<｜DSML｜ parameter name="arguments" string="false">${argumentsText}</｜DSML｜ parameter>\n${extra}</｜DSML｜ invoke>\n</｜DSML｜ calls>`;
+  const describe = '<｜DSML｜ parameter name="description" string="true">Check whether per-visit event fix was made</｜DSML｜ parameter>\n';
+  expectCalls("argument object next to a declared description",
+    pwshCall(JSON.stringify({ command: psCommand }), describe),
+    [["pwsh", { description: "Check whether per-visit event fix was made", command: psCommand }]]);
+  expectCalls("argument object marked string=true next to a declared description",
+    pwshCall(JSON.stringify({ command: "Get-Date" }), describe).replace('string="false"', 'string="true"'),
+    [["pwsh", { description: "Check whether per-visit event fix was made", command: "Get-Date" }]]);
+  expectCalls("a key in both places takes the object's value",
+    pwshCall(JSON.stringify({ command: "Get-Date", description: "inner" }), describe),
+    [["pwsh", { description: "inner", command: "Get-Date" }]]);
+  expectCalls("argument object with a stray closing brace",
+    pwshCall(`${JSON.stringify({ command: "Get-Date", description: "d" })}}`),
+    [["pwsh", { command: "Get-Date", description: "d" }]]);
+  expectCalls("argument object with a stray closing bracket, next to a description",
+    pwshCall(`${JSON.stringify({ command: "Get-Date" })}]`, describe),
+    [["pwsh", { description: "Check whether per-visit event fix was made", command: "Get-Date" }]]);
+  expectCalls("argument object next to a glued name with a stray quote",
+    pwshCall(JSON.stringify({ command: "Get-Date", description: "d" }), '<｜DSML｜ parameter name="name": "pwsh</｜DSML｜ parameter>\n'),
+    [["pwsh", { command: "Get-Date", description: "d" }]]);
+  expectNoCall("argument object next to an undeclared parameter",
+    pwshCall(JSON.stringify({ command: "Get-Date" }), '<｜DSML｜ parameter name="cwd" string="true">C:\\</｜DSML｜ parameter>\n'));
+  expectNoCall("argument object followed by another call object",
+    pwshCall(`${JSON.stringify({ command: "Get-Date", description: "d" })}, {"name": "read", "arguments": {"file_path": "a.md"}}]`));
+  expectNoCall("argument object next to a name for another tool",
+    pwshCall(JSON.stringify({ command: "Get-Date" }), '<｜DSML｜ parameter name="name" string="true">shell</｜DSML｜ parameter>\n' + describe));
+  // A sibling cut off by the end of the stream is never merged in.
+  expectNoCall("argument object next to a description cut off by the end of the stream",
+    '<｜DSML｜ calls>\n<｜DSML｜ invoke name="pwsh">\n<｜DSML｜ parameter name="arguments" string="false">{"command": "Get-Date"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name="description" string="true">Check whe');
+  expectNoCall("edit object next to a newString cut off by the end of the stream",
+    '<｜DSML｜ calls>\n<｜DSML｜ invoke name="edit">\n<｜DSML｜ parameter name="arguments" string="false">{"path": "a.py", "oldString": "x = 1"}</｜DSML｜ parameter>\n<｜DSML｜ parameter name="newString" string="true">x = 2\ny = ');
+
+  // Not done on purpose: bare text when the tool has several required
+  // parameters and the others came as siblings. Applied to edit, it would
+  // put the text into newString whenever path and oldString came separately.
+  expectNoCall("bare arguments next to a description for a tool with two required parameters",
+    pwshCall("Get-ChildItem C:\\", describe).replace('string="false"', 'string="true"'));
 
   // Still refused: these need a retry.
   expectNoCall("bare arguments for a tool with several required parameters",

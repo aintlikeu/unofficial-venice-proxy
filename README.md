@@ -409,7 +409,11 @@ How it works:
      across stream deltas. Closing tags may put the slash after the pipe
      (`<|/DSML|parameter>`). A single parameter named `arguments` whose value is an object
      is unwrapped into the call's arguments, also when a `name` parameter repeating the tool
-     name sits next to it. The model sometimes glues the value to the name with a colon and
+     name sits next to it, and merged with other parameters next to it that the tool declares
+     (`description` for a shell tool that requires one); a key in both places takes the
+     object's value, and an undeclared parameter next to it leaves the call to a retry. An
+     object followed by stray closing brackets (`{…}}`, `{…}]`) is read as that object; any
+     other text after it is not. The model sometimes glues the value to the name with a colon and
      leaves out the `>`: `<|DSML|parameter name="arguments":{"path":"a.js",…}}</|DSML|parameter>`.
      That value is read as the JSON at its start (a stray trailing `}` is ignored), and a `>`
      inside it (an arrow function, say) is not taken for the end of the tag. The `arguments`
