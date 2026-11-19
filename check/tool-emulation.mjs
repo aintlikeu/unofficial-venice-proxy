@@ -2172,6 +2172,48 @@ function testLiveDeepseekShapes() {
   );
   ok("declared string arguments parameter kept as text",
     declared.toolCalls[0] && args(declared.toolCalls[0]).arguments === '{"a":1}');
+
+  // An invoke tag glued to the rest of a JSON call, then a <tool_call> closed
+  // by DSML end tags (live, 2026-11-19: reached the client as text, unlogged).
+  expectCalls("invoke tag glued to JSON arguments, then a <tool_call> closed by DSML tags",
+    '<|DSML|invoke name="shell","arguments":{"command":"grep -n \\"###\\" docs/cli.md | head -60"}}\n' +
+      '<tool_call>{"name":"shell","arguments":{"command":"grep -n \\"library\\" -A 3 docs/cli.md | head -80"}}</|DSML|parameter>\n</|DSML|invoke>',
+    [["shell", { command: 'grep -n "###" docs/cli.md | head -60' }], ["shell", { command: 'grep -n "library" -A 3 docs/cli.md | head -80' }]]);
+  expectCalls("glued invoke with fullwidth pipes and a > in the command",
+    '<｜DSML｜ invoke name="shell", "arguments": {"command":"ls > out.txt"}}',
+    [["shell", { command: "ls > out.txt" }]]);
+  expectCalls("glued invoke followed by an XML invoke",
+    '<|DSML|invoke name="shell","arguments":{"command":"ls"}}\n<|DSML|invoke name="shell"><|DSML|parameter name="command" string="true">pwd</|DSML|parameter></|DSML|invoke>',
+    [["shell", { command: "ls" }], ["shell", { command: "pwd" }]]);
+  expectNoCall("glued invoke whose object never closes",
+    '<|DSML|invoke name="shell","arguments":{"command":"ls"}\n<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>');
+  expectNoCall("glued invoke of an unknown tool", '<|DSML|invoke name="rm_rf","arguments":{"path":"/"}}');
+  expectCalls("<tool_call> JSON closed by </invoke>",
+    '<tool_call>{"name":"shell","arguments":{"command":"ls"}}\n</｜DSML｜ invoke>', [["shell", { command: "ls" }]]);
+  expectCalls("a DSML end tag inside a JSON string does not end the call",
+    '<tool_call>{"name":"shell","arguments":{"command":"echo </|DSML|parameter> x"}}</tool_call>',
+    [["shell", { command: "echo </|DSML|parameter> x" }]]);
+  expectCalls("DSML closers between two <tool_call> blocks are skipped",
+    '<tool_call>{"name":"shell","arguments":{"command":"ls"}}</|DSML|parameter>\n</|DSML|invoke>\n<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+    [["shell", { command: "ls" }], ["shell", { command: "pwd" }]]);
+  expectCalls("invoke tag missing its >",
+    '<|DSML|invoke name="shell"\n<|DSML|parameter name="command" string="true">ls -la</|DSML|parameter>\n</|DSML|invoke>',
+    [["shell", { command: "ls -la" }]]);
+  expectNoCall("invoke tag cut off before its >", 'Checking.\n<|DSML|invoke name="shell"');
+  // A DSML parameter after the JSON call would be dropped: retried instead.
+  const sibling = '\n<|DSML|parameter name="workdir" string="true">/x</|DSML|parameter>\n</|DSML|invoke>';
+  expectNoCall("DSML parameter after a <tool_call> closed by DSML tags",
+    `<tool_call>{"name":"shell","arguments":{"command":"ls"}}</|DSML|parameter>${sibling}`);
+  expectNoCall("DSML parameter after a glued invoke",
+    `<|DSML|invoke name="shell","arguments":{"command":"ls"}}${sibling}`);
+  expectNoCall("DSML parameter after an unclosed <tool_call>",
+    `<tool_call>{"name":"shell","arguments":{"command":"ls"}}${sibling}`);
+  expectCalls("glued invoke followed only by whitespace",
+    `<|DSML|invoke name="shell","arguments":{"command":"ls"}}\n\n`, [["shell", { command: "ls" }]]);
+  const prose = both("Use <|DSML|invoke x <b>bold</b> here.");
+  ok("an invoke marker without a name stays text",
+    prose.whole.toolCalls.length === 0 && prose.streamed.invalid.length === 0 && prose.streamed.text.includes("<b>bold</b>"),
+    JSON.stringify(prose.streamed.text));
 }
 
 async function testTrailingJunk() {

@@ -108,6 +108,7 @@ const DSML_XML_INVOKE_VARIANTS = pipeVariants(DSML_XML_INVOKE);
 const DSML_XML_INVOKE_END_VARIANTS = pipeVariants(DSML_XML_INVOKE_END);
 const DSML_XML_PARAMETER_VARIANTS = pipeVariants(DSML_XML_PARAMETER);
 const DSML_XML_PARAMETER_END_VARIANTS = pipeVariants(DSML_XML_PARAMETER_END);
+const DSML_XML_END_VARIANTS = [...DSML_XML_PARAMETER_END_VARIANTS, ...DSML_XML_INVOKE_END_VARIANTS];
 DSML_NOISE.push(...pipeVariants(DSML_XML_CALLS_BEGIN), ...pipeVariants(DSML_XML_CALLS_END));
 CALL_TAGS.push(
   ...DSML_XML_INVOKE_VARIANTS.map((open) => ({
@@ -1154,6 +1155,52 @@ function parseNamedCall(body, tools, terminated) {
 
 // name="key": followed by a JSON value, with no closing ">".
 const DSML_GLUED_PARAMETER = /^\s*name\s*=\s*"([^"]*)"\s*:\s*/;
+
+// An invoke whose opening tag runs straight into the rest of a JSON call, so
+// it never gets its ">" (seen live, deepseek-v4-1-flash-uncensored):
+//   <|DSML|invoke name="shell","arguments":{"command":"…"}}
+// It is read as {"name":"shell","arguments":{…}}, which ends where that
+// object closes.
+const DSML_GLUED_INVOKE = /^\s*name\s*=\s*"([^"<>]*)"\s*,(?=\s*")/;
+const DSML_GLUED_INVOKE_TAG = { open: "", close: [], wrapper: false, dynamic: "dsml-glued" };
+
+// A DSML parameter tag after a call's JSON object adds an argument the JSON
+// lacks (seen live: description, name, after a <tool_call> closed by DSML
+// tags). Dropping it could run the call with the wrong arguments, so such a
+// call is an error and the reply is retried. `rest` is the text after the
+// object (and its closing tag). Returns true, false, or "wait" while `rest`
+// could still turn into such a tag.
+function dsmlParameterFollows(rest) {
+  const next = rest.trimStart();
+  if (DSML_XML_PARAMETER_VARIANTS.some((open) => next.startsWith(open))) {
+    return true;
+  }
+  if (rest.length > TRAILING_JUNK_LIMIT) {
+    return false;
+  }
+  return !next || DSML_XML_PARAMETER_VARIANTS.some((open) => open.startsWith(next)) ? "wait" : false;
+}
+const DSML_PARAMETER_AFTER_CALL = "a DSML parameter follows the JSON call";
+
+// End of a <tool_call> whose JSON body is closed by DSML end tags instead of
+// </tool_call> (seen live):
+//   <tool_call>{"name":"shell","arguments":{…}}</|DSML|parameter>
+// Accepted only right after one complete JSON object. Returns the body length
+// and the length through the DSML tag, or null.
+function jsonBodyClosedByDsml(buffer) {
+  const start = buffer.length - buffer.trimStart().length;
+  if (buffer[start] !== "{") {
+    return null;
+  }
+  const object = extractJsonObject(buffer);
+  if (!object) {
+    return null;
+  }
+  const bodyEnd = start + object.length;
+  const gap = /^\s*/.exec(buffer.slice(bodyEnd))[0].length;
+  const { index, token } = findEarliestToken(buffer, DSML_XML_END_VARIANTS, bodyEnd + gap);
+  return index === bodyEnd + gap ? { bodyEnd, end: index + token.length } : null;
+}
 const JSON_LEADING_SCALAR = /^(?:"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/;
 
 // The JSON value at the start of `text`, ignoring whatever follows it.
@@ -1592,8 +1639,12 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           // apology, a "fixed" retry, a summary) ends the reply. Stray
           // wrapper closers (e.g. </tool_call> after a bare <function=…>)
           // are skipped.
-          const trimmed = buffer.trimStart().replace(/^(?:<\/(?:tool_call|proxy_call)>\s*)+/, "");
-          if (!trimmed || CALL_TAGS.some((tag) => [].concat(tag.close).some((close) => close.startsWith(trimmed)))) {
+          const trimmed = buffer.trimStart().replace(/^(?:<\/(?:tool_call|proxy_call|\|DSML\|(?:parameter|invoke))>\s*)+/, "");
+          if (
+            !trimmed ||
+            CALL_TAGS.some((tag) => [].concat(tag.close).some((close) => close.startsWith(trimmed))) ||
+            DSML_XML_END_VARIANTS.some((close) => close.startsWith(trimmed))
+          ) {
             buffer = trimmed;
             return;
           }
@@ -1621,14 +1672,26 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
         }
         if (tag.dynamic === "dsml-invoke") {
           const after = buffer.slice(index + tag.open.length);
-          const head = /^[^<>]*>/.exec(after);
+          const glued = DSML_GLUED_INVOKE.exec(after);
+          if (glued) {
+            emitText(buffer.slice(0, index));
+            openTagText = "";
+            buffer = `{"name":${JSON.stringify(glued[1].trim())},${after.slice(glued[0].length)}`;
+            currentTag = DSML_GLUED_INVOKE_TAG;
+            mode = "tag";
+            continue;
+          }
+          // The tag ends at its ">" or, when the model left that out, where
+          // the next tag starts; waiting for a ">" that never comes held the
+          // whole reply and released it as text at the end.
+          const head = /^[^<>]*>/.exec(after) ?? /^[^<>]*(?=<)/.exec(after);
           if (!head) {
             // The opening tag is still arriving.
             emitText(buffer.slice(0, index));
             buffer = buffer.slice(index);
             return;
           }
-          const attributes = parseDsmlAttributes(head[0].slice(0, -1));
+          const attributes = parseDsmlAttributes(head[0].replace(/>$/, ""));
           if (!String(attributes.name ?? "").trim()) {
             // Not an invoke after all: let it flow as text and rescan.
             emitText(buffer.slice(0, index + tag.open.length));
@@ -1697,6 +1760,22 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           return;
         }
       }
+      if (currentTag.dynamic === "dsml-glued") {
+        const object = extractJsonObject(buffer);
+        if (!object) {
+          return;
+        }
+        const end = buffer.indexOf(object) + object.length;
+        const follows = dsmlParameterFollows(buffer.slice(end));
+        if (follows === "wait") {
+          return;
+        }
+        const body = buffer.slice(0, end);
+        buffer = buffer.slice(end);
+        mode = "text";
+        emitCall(follows ? { error: DSML_PARAMETER_AFTER_CALL } : parseCallBody(body, known), body);
+        continue;
+      }
       // A bare <function=…> block keeps its tag in the body.
       const closes = [].concat(currentTag.close);
       let closeIndex = -1;
@@ -1706,6 +1785,21 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
         if (at !== -1 && (closeIndex === -1 || at < closeIndex)) {
           closeIndex = at;
           closeToken = token;
+        }
+      }
+      if (currentTag.open === OPEN_TAG) {
+        const dsmlClose = jsonBodyClosedByDsml(buffer);
+        if (dsmlClose && (closeIndex === -1 || closeIndex >= dsmlClose.bodyEnd)) {
+          const follows = dsmlParameterFollows(buffer.slice(dsmlClose.end));
+          if (follows === "wait") {
+            return;
+          }
+          const body = buffer.slice(0, dsmlClose.bodyEnd);
+          const raw = `${openTagText}${buffer.slice(0, dsmlClose.end)}`;
+          buffer = buffer.slice(dsmlClose.end);
+          mode = "text";
+          emitCall(follows ? { error: DSML_PARAMETER_AFTER_CALL } : parseCallBody(body, known), raw);
+          continue;
         }
       }
       if (closeIndex === -1) {
@@ -1779,15 +1873,24 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       if (mode === "tag") {
         // Unterminated block, usually an output-length cut-off.
         const body = buffer;
+        const object = currentTag.dynamic === "dsml-invoke" ? null : extractJsonObject(body);
         const result = currentTag.dynamic === "dsml-invoke"
           ? parseDsmlInvoke(openTagText, body, known, { terminated: false })
-          : parseCallBody(body, known, { terminated: false });
+          : object && DSML_XML_PARAMETER_VARIANTS.some((open) => body.slice(body.indexOf(object) + object.length).includes(open))
+            ? { error: DSML_PARAMETER_AFTER_CALL }
+            : parseCallBody(body, known, { terminated: false });
         emitCall(
           result.toolCall ? result : { error: `unterminated tool call (${result.error})` },
           `${openTagText}${body}`,
         );
       } else if (toolCallCount === 0) {
-        emitText(buffer);
+        const open = DSML_XML_INVOKE_VARIANTS.find((variant) => buffer.startsWith(variant));
+        if (open && String(parseDsmlAttributes(buffer.slice(open.length)).name ?? "").trim()) {
+          // An invoke tag cut off before its ">".
+          emitCall({ error: "unterminated tool call (DSML invoke tag without \">\")" }, buffer);
+        } else {
+          emitText(buffer);
+        }
       }
       flushWhitespace();
       buffer = "";

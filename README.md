@@ -428,7 +428,11 @@ How it works:
      written straight into the invoke, without parameter tags
      (`<|DSML|invoke name="shell">{"command":"ls"}</|DSML|invoke>`), is parsed when only
      closing tags follow it. A DSML invoke written inside `<tool_call>` or `<proxy_call>`
-     (closed or not) is parsed as DSML.
+     (closed or not) is parsed as DSML. An invoke tag that runs straight into the rest of a
+     JSON call, `<|DSML|invoke name="shell","arguments":{"command":"ls"}}`, is read as that
+     call and ends where its object closes; an invoke tag missing its `>` ends where the next
+     tag starts. `<tool_call>` JSON closed by `</|DSML|parameter>` or `</|DSML|invoke>`
+     instead of `</tool_call>` ends right after the complete JSON object.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
