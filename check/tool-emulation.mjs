@@ -2208,6 +2208,58 @@ function testLiveDeepseekShapes() {
     `<|DSML|invoke name="shell","arguments":{"command":"ls"}}${sibling}`);
   expectNoCall("DSML parameter after an unclosed <tool_call>",
     `<tool_call>{"name":"shell","arguments":{"command":"ls"}}${sibling}`);
+  // DSML parameters with no invoke tag, the tool named by a "name" parameter
+  // (live, deepseek-v4-1-flash in the proxy format, 2026-11-20).
+  const headless = (tool, argsJson) =>
+    `<proxy_call>\n<｜DSML｜ parameter name="arguments" string="false">${argsJson}</｜DSML｜ parameter>\n` +
+    `<｜DSML｜ parameter name="name" string="true">${tool}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n`;
+  expectCalls("parameters without an invoke tag, named by a name parameter",
+    `\n\n${headless("shell", '{"command": "ls -la", "timeout": 60}')}${headless("edit", '{"path": "a.js", "oldString": "a", "newString": "b"}')}</｜DSML｜ calls>`,
+    [["shell", { command: "ls -la", timeout: 60 }], ["edit", { path: "a.js", oldString: "a", newString: "b" }]]);
+  expectCalls("a nameless invoke followed by a named one",
+    `${headless("shell", '{"command": "ls"}')}<｜DSML｜ invoke name="shell">\n<｜DSML｜ parameter name="command" string="true">pwd</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: "ls" }], ["shell", { command: "pwd" }]]);
+  expectCalls("nameless invoke closed by </tool_call>",
+    '<tool_call><|DSML|parameter name="name" string="true">shell</|DSML|parameter><|DSML|parameter name="command" string="true">ls</|DSML|parameter></tool_call>',
+    [["shell", { command: "ls" }]]);
+  expectNoCall("nameless invoke naming an unknown tool", headless("rm_rf", '{"path": "/"}'));
+  expectNoCall("nameless invoke without a name parameter",
+    '<proxy_call>\n<|DSML|parameter name="arguments" string="false">{"command": "ls"}</|DSML|parameter>\n</|DSML|invoke>');
+  const namedTool = {
+    name: "tag",
+    parameters: { type: "object", properties: { name: { type: "string" }, color: { type: "string" } }, required: ["name"] },
+  };
+  const ambiguous = parseToolCalls(
+    '<proxy_call><|DSML|parameter name="name" string="true">tag</|DSML|parameter><|DSML|parameter name="color" string="true">red</|DSML|parameter></|DSML|invoke>',
+    [namedTool],
+  );
+  ok("a name parameter does not name a tool that has a name argument", ambiguous.toolCalls.length === 0);
+  expectCalls("two <proxy_call> JSON calls closed by DSML tags",
+    '<proxy_call>{"name":"shell","arguments":{"command":"ls"}}</|DSML|parameter>\n</|DSML|invoke>\n' +
+      '<proxy_call>{"name":"shell","arguments":{"command":"pwd"}}</|DSML|parameter>\n</|DSML|invoke>',
+    [["shell", { command: "ls" }], ["shell", { command: "pwd" }]]);
+
+  // The call object missing only its last "}" before a DSML end tag (live,
+  // 2026-11-19 and 2026-11-20).
+  const scan = `ssh -o BatchMode=yes root@h 'for p in 22 445; do echo "$p"; done'`;
+  expectCalls("<proxy_call> call missing its last brace before a DSML tag",
+    `\n<proxy_call>{"name":"shell","arguments":{"command":${JSON.stringify(scan)},"timeout":120}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>`,
+    [["shell", { command: scan, timeout: 120 }]]);
+  expectCalls("<tool_call> call missing its last brace, then another call",
+    '<tool_call>{"name":"shell","arguments":{"command":"ls crates"}</|DSML|parameter>\n</|DSML|invoke>\n<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+    [["shell", { command: "ls crates" }], ["shell", { command: "pwd" }]]);
+  expectCalls("a DSML tag inside the string of a call missing its last brace",
+    '<proxy_call>{"name":"shell","arguments":{"command":"echo </|DSML|parameter> }"}</|DSML|parameter></|DSML|invoke>',
+    [["shell", { command: "echo </|DSML|parameter> }" }]]);
+  expectNoCall("a call missing its last brace cut off by the end of the stream",
+    '<proxy_call>{"name":"shell","arguments":{"command":"ls"}');
+  expectNoCall("a call missing two braces", '<proxy_call>{"name":"shell","arguments":{"command":"ls"</|DSML|parameter></|DSML|invoke>');
+  expectNoCall("a brace is not added to arguments that are not an object",
+    '<proxy_call>{"name":"shell","arguments":"ls","x":{"a":1}</|DSML|parameter></|DSML|invoke>');
+  expectNoCall("a brace is not added to a call without a name",
+    '<proxy_call>{"code":"print(1)","x":{"reset":true}</|DSML|parameter></|DSML|invoke>');
+  expectNoCall("a call missing its last brace, then a DSML parameter",
+    `<proxy_call>{"name":"shell","arguments":{"command":"ls"}</|DSML|parameter>${sibling}`);
   expectCalls("glued invoke followed only by whitespace",
     `<|DSML|invoke name="shell","arguments":{"command":"ls"}}\n\n`, [["shell", { command: "ls" }]]);
   const prose = both("Use <|DSML|invoke x <b>bold</b> here.");

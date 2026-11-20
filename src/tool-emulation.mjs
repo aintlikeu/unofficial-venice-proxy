@@ -1182,11 +1182,12 @@ function dsmlParameterFollows(rest) {
 }
 const DSML_PARAMETER_AFTER_CALL = "a DSML parameter follows the JSON call";
 
-// End of a <tool_call> whose JSON body is closed by DSML end tags instead of
-// </tool_call> (seen live):
+// End of a <tool_call> or <proxy_call> whose JSON body is closed by DSML end
+// tags instead of its own closer (seen live):
 //   <tool_call>{"name":"shell","arguments":{…}}</|DSML|parameter>
-// Accepted only right after one complete JSON object. Returns the body length
-// and the length through the DSML tag, or null.
+// Accepted only right after one complete JSON object. Returns the body length,
+// the length through the DSML tag and, when repaired, the body to parse; or
+// null.
 function jsonBodyClosedByDsml(buffer) {
   const start = buffer.length - buffer.trimStart().length;
   if (buffer[start] !== "{") {
@@ -1194,12 +1195,36 @@ function jsonBodyClosedByDsml(buffer) {
   }
   const object = extractJsonObject(buffer);
   if (!object) {
-    return null;
+    return callMissingLastBrace(buffer, start);
   }
   const bodyEnd = start + object.length;
   const gap = /^\s*/.exec(buffer.slice(bodyEnd))[0].length;
   const { index, token } = findEarliestToken(buffer, DSML_XML_END_VARIANTS, bodyEnd + gap);
   return index === bodyEnd + gap ? { bodyEnd, end: index + token.length } : null;
+}
+
+// The same call object missing only its last "}" (seen live three times, on
+// both DeepSeek V4.1 Flash builds):
+//   <proxy_call>{"name":"terminal","arguments":{"command":"…","timeout":120}</|DSML|parameter>
+// Repaired only when a DSML end tag follows (so the reply was not cut off),
+// the text before it ends with "}", and one more "}" makes an object with a
+// "name" and an "arguments" object. A DSML tag inside a string is skipped:
+// the text before it does not parse.
+function callMissingLastBrace(buffer, start) {
+  for (let from = start; ; ) {
+    const { index, token } = findEarliestToken(buffer, DSML_XML_END_VARIANTS, from);
+    if (index === -1) {
+      return null;
+    }
+    const candidate = buffer.slice(start, index).trimEnd();
+    if (candidate.endsWith("}")) {
+      const parsed = parseJsonLenient(`${candidate}}`, { whole: true });
+      if (parsed && isPlainObject(parsed.value) && typeof parsed.value.name === "string" && isPlainObject(parsed.value.arguments)) {
+        return { bodyEnd: index, end: index + token.length, body: `${candidate}}` };
+      }
+    }
+    from = index + token.length;
+  }
 }
 const JSON_LEADING_SCALAR = /^(?:"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/;
 
@@ -1253,8 +1278,18 @@ function parseDsmlParameterValue(attributes, text, tool, key) {
 // Parses one <|DSML|invoke name="…"> block. `openTag` is the opening tag text,
 // `body` everything between it and </|DSML|invoke>. Returns { toolCall } or
 // { error }. A block cut off at the end of the stream is best-effort.
+// Tool named by a "name" parameter of an invoke with no invoke tag. Only a
+// known tool that has no "name" argument of its own.
+const DSML_NAME_PARAMETER =
+  /<[|\uFF5C]DSML[|\uFF5C]parameter\s+name\s*=\s*"name"[^>]*>\s*"?([^"<]*?)"?\s*<\/[|\uFF5C]DSML[|\uFF5C]parameter>/;
+function dsmlNameParameter(body, tools) {
+  const name = DSML_NAME_PARAMETER.exec(String(body))?.[1].trim();
+  const tool = name ? tools.get(name) : null;
+  return tool && !Object.hasOwn(tool.parameters?.properties ?? {}, "name") ? name : "";
+}
+
 function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
-  const name = String(parseDsmlAttributes(openTag).name ?? "").trim();
+  const name = String(parseDsmlAttributes(openTag).name ?? "").trim() || (openTag ? "" : dsmlNameParameter(body, tools));
   if (!name) {
     return { error: "missing tool name" };
   }
@@ -1327,6 +1362,10 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   // (the {"name", "arguments"} call object split into parameters). Unwrap it
   // unless the tool really declares those names.
   const declared = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : {};
+  if (!openTag) {
+    // The "name" parameter named the tool; it is not an argument.
+    delete parsedArgs.name;
+  }
   // The wrapped object also comes marked string="true", i.e. as JSON text, or
   // with stray closing brackets after it (seen live: {…}} and {…}]).
   if (typeof parsedArgs.arguments === "string" && !Object.hasOwn(declared, "arguments")) {
@@ -1756,7 +1795,17 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           mode = "text";
           continue;
         }
-        if (inner && DSML_XML_INVOKE_VARIANTS.some((open) => open.startsWith(inner))) {
+        // Parameters with no invoke tag, the tool named by a "name"
+        // parameter (seen live, deepseek-v4-1-flash in the proxy format):
+        //   <proxy_call><|DSML|parameter name="arguments" string="false">{…}</|DSML|parameter>
+        //   <|DSML|parameter name="name" string="true">terminal</|DSML|parameter></|DSML|invoke>
+        if (DSML_XML_PARAMETER_VARIANTS.some((open) => inner.startsWith(open))) {
+          buffer = inner;
+          openTagText = "";
+          currentTag = { open: "", close: [...DSML_XML_INVOKE_END_VARIANTS, ...[].concat(currentTag.close)], wrapper: true, dynamic: "dsml-invoke" };
+          continue;
+        }
+        if (inner && [...DSML_XML_INVOKE_VARIANTS, ...DSML_XML_PARAMETER_VARIANTS].some((open) => open.startsWith(inner))) {
           return;
         }
       }
@@ -1787,14 +1836,14 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           closeToken = token;
         }
       }
-      if (currentTag.open === OPEN_TAG) {
+      if (currentTag.open === OPEN_TAG || currentTag.open === PROXY_OPEN_TAG) {
         const dsmlClose = jsonBodyClosedByDsml(buffer);
         if (dsmlClose && (closeIndex === -1 || closeIndex >= dsmlClose.bodyEnd)) {
           const follows = dsmlParameterFollows(buffer.slice(dsmlClose.end));
           if (follows === "wait") {
             return;
           }
-          const body = buffer.slice(0, dsmlClose.bodyEnd);
+          const body = dsmlClose.body ?? buffer.slice(0, dsmlClose.bodyEnd);
           const raw = `${openTagText}${buffer.slice(0, dsmlClose.end)}`;
           buffer = buffer.slice(dsmlClose.end);
           mode = "text";
