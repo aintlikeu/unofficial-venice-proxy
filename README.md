@@ -188,7 +188,9 @@ What the proxy does about it:
 - **Overflow as a 400.** A 413 `userPromptTooLong` / `userMessageTooLong` from Venice comes back as HTTP 400 with `code: "context_length_exceeded"` and a message starting `prompt is too long`, the shape OpenAI-compatible clients treat as a context overflow (opencode then compacts and retries) instead of a server error.
 - **Large context opt-in.** Like the web app, the chat request carries `enableLargeContextChat: true` for a model the catalog marks as `largeContextChatEligible` (at the time of writing GLM 5.2 and `qwen-3-8-27b`) and that does not bill credits (`usesCredits`); the translate log shows `large_context=on`. Without it, the web client limits a prompt to 50K or 25K tokens on its own side. `VENICE_LARGE_CONTEXT=off` stops sending it.
 
-Clients still need a context limit to compact against. In opencode, give each model a `limit`, for example:
+Clients still need a context limit to compact against. `GET /v1/models` gives each model a top-level `context_length`: the catalog's `maxContextLength` in tokens (for example 1000000 for `deepseek-v4-1-flash`, 524288 for `deepseek-v4-1-flash-uncensored`). An agent-endpoint model takes the window of the catalog entry that lists it in `aliasIds`. The field is left out when the catalog has no positive integer for the model. Hermes reads it on its own (it takes the first integer among `context_length`, `max_model_len` and similar keys, and caches the result on disk, so a gateway restart picks up a change sooner). Venice reports this window, but prompts larger than about 391K estimated tokens have not been tried live through the web endpoint.
+
+In opencode, the models of a custom provider are listed in its config; give each one a `limit`, for example:
 
 ```json
 "zai-org-glm-5-2": { "limit": { "context": 200000, "output": 32768 } },

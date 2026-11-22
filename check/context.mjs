@@ -449,11 +449,54 @@ function testEnvOff() {
   ok("other values keep it on", run("on") === true);
 }
 
+// /v1/models carries the catalog's maxContextLength as a top-level
+// context_length (Hermes reads it to size its compaction), and only when the
+// catalog has a usable number.
+async function testModelsList() {
+  section("/v1/models context_length");
+  const proxy = createVeniceOpenAiProxy();
+  proxy.ensureAuth = async () => ({ login: { clerkJwt: "jwt" } });
+  const agentIds = proxy.agentic.agentEndpointModels();
+  const catalog = [
+    { id: "big", type: "text", usesCredits: false, maxContextLength: 1000000 },
+    { id: "aliased", type: "text", usesCredits: false, maxContextLength: 524288, aliasIds: [agentIds[0]] },
+    { id: "no-ctx", type: "text", usesCredits: false },
+    { id: "zero", type: "text", usesCredits: false, maxContextLength: 0 },
+    { id: "text-ctx", type: "text", usesCredits: false, maxContextLength: "200000" },
+    { id: "fraction", type: "text", usesCredits: false, maxContextLength: 1.5 },
+    { id: "paid", type: "text", usesCredits: true, maxContextLength: 128000 },
+  ];
+  proxy.client.getTextModels = async () => catalog;
+
+  const free = await proxy.getModels({ onlyFree: true });
+  const byId = Object.fromEntries(free.map((model) => [model.id, model]));
+  ok("catalog window → top-level context_length", byId.big?.context_length === 1000000, JSON.stringify(byId.big));
+  ok("second model keeps its own window", byId.aliased?.context_length === 524288, String(byId.aliased?.context_length));
+  for (const id of ["no-ctx", "zero", "text-ctx", "fraction"]) {
+    ok(`${id}: no context_length`, byId[id] && !("context_length" in byId[id]), JSON.stringify(byId[id]));
+  }
+  ok("not nested under venice", free.every((model) => !("context_length" in model.venice)));
+  ok("paid model still left out", !byId.paid);
+  ok(
+    "agent model named as an alias takes that entry's window",
+    byId[agentIds[0]]?.context_length === 524288,
+    JSON.stringify(byId[agentIds[0]]),
+  );
+
+  catalog[1].aliasIds = [];
+  const unaliased = (await proxy.getModels({ onlyFree: true })).find((model) => model.id === agentIds[0]);
+  ok("agent model without an alias: no context_length", unaliased && !("context_length" in unaliased), JSON.stringify(unaliased));
+
+  const all = await proxy.getModels();
+  ok("paid model listed with its window when not filtered", all.find((model) => model.id === "paid")?.context_length === 128000);
+}
+
 async function main() {
   testHelpers();
   testFoldHelpers();
   await testProxy();
   await testClientBody();
+  await testModelsList();
   testEnvOff();
   console.log(`\n${"─".repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed`);

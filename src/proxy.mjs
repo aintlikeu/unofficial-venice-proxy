@@ -645,6 +645,15 @@ function updateStreamStats(stats, event) {
   }
 }
 
+// The model's context window from the catalog (maxContextLength) as
+// context_length, which clients such as Hermes read from /v1/models to decide
+// when to compact. Left out when the catalog has no usable number, so a client
+// falls back to its own lookup instead of trusting a made-up one.
+function contextLengthField(model) {
+  const value = model?.maxContextLength;
+  return Number.isSafeInteger(value) && value > 0 ? { context_length: value } : {};
+}
+
 function isTeeModel(model) {
   return typeof model === "string" && model.startsWith("e2ee-");
 }
@@ -1118,6 +1127,7 @@ class VeniceOpenAiProxy {
         object: "model",
         created: Math.floor((model.releasedAt || Date.now()) / 1000),
         owned_by: "venice-web",
+        ...contextLengthField(model),
         permission: [],
         root: model.apiModelId || model.id,
         parent: null,
@@ -1129,15 +1139,19 @@ class VeniceOpenAiProxy {
       }));
 
     // Agent-endpoint models are missing from the catalog, so list them by hand.
+    // The catalog may still name one as an alias of a listed model; its window
+    // then comes from that entry.
     for (const id of this.agentic.agentEndpointModels()) {
       if (data.some((model) => model.id === id)) {
         continue;
       }
+      const aliasOf = models.find((model) => Array.isArray(model?.aliasIds) && model.aliasIds.includes(id));
       data.push({
         id,
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "venice-web",
+        ...contextLengthField(aliasOf),
         permission: [],
         root: id,
         parent: null,
