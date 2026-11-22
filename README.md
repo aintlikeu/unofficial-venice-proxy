@@ -680,7 +680,7 @@ The proxy logs:
 - `content_chars`
 - `reasoning_chars`
 - `tools` and `tool_calls` counts for requests that used tool emulation, plus `tool_attempts=2` when a call was retried (the translate line also shows `tools`, `tool_choice` and `tool_format`)
-- on the translate line, `est_prompt_tokens` (the estimated prompt size sent to Venice) and `large_context=on` when the request opted in to the model's full context
+- on the translate line, `media_omitted=N` when images, files or audio were replaced with a note (see Notes and limitations), and `est_prompt_tokens` (the estimated prompt size sent to Venice) and `large_context=on` when the request opted in to the model's full context
 - total request duration
 - stream duration for streaming completions
 
@@ -693,6 +693,7 @@ The proxy logs:
 - The proxy does not perform interactive login during requests.
 - Venice's chat endpoint keeps only the last of several same-role messages in a row, so `/v1/chat/completions` merges adjacent user (or assistant) messages into one turn, separated by a blank line. Tool results count as assistant turns, as before.
 - Venice rejects any request containing a null byte (`String must not contain null bytes`), and tool output such as `find -print0` or a binary file can carry them. The proxy replaces null bytes with `�` (U+FFFD) in everything it sends to Venice, on every endpoint; the translate log line shows `null_bytes_replaced=N` when it did.
+- Images, files and audio are not passed on: the proxy talks to Venice's text chat. On every endpoint (`/v1/chat/completions`, agent models such as `deepseek-v4-1-flash-free`, and `/v1/responses`), each `image_url`, `input_image`, `file`, `input_file` or `input_audio` part is replaced with a one-line note such as `[Image omitted (image/png): this connection carries text only, so the image was not delivered and you cannot see its content; reading or sending it again will not change that. Do not guess what it contains.]`. The note names a data URL's media type, a web URL up to 2000 characters (so the model can fetch it with its own tools; a longer one is left out rather than cut), or a file name, never the data. Before this, such parts were dropped silently, and a model that had read a screenshot with opencode's `read` tool (opencode sends the result as "Image read successfully" plus a user message holding only the image) described images it never saw. For non-agent models the translate log line shows `media_omitted=N` (agent models have no translate line); it counts every such part in the request, so in a long session it repeats for older images still in the history. The incoming body still carries the base64 data, which is why such sessions log request lengths of many megabytes while `est_prompt_tokens` stays small.
 - For container startup, login/restore happens once before the server starts.
 
 ## Troubleshooting

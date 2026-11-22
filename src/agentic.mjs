@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { omittedMediaNote } from "./openai-content.mjs";
 import { replaceNullBytes } from "./venice-text.mjs";
 
 const DEFAULT_AGENTIC_MODEL = "kimi-k2-5";
@@ -82,7 +83,8 @@ function normalizeContent(content) {
       .map((part) => {
         if (typeof part === "string") return part;
         if (typeof part?.text === "string") return part.text;
-        return "";
+        // Images, files and audio cannot be passed on; see openai-content.mjs.
+        return omittedMediaNote(part);
       })
       .filter(Boolean)
       .join("\n");

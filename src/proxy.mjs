@@ -3,7 +3,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 import { AgenticProxy } from "./agentic.mjs";
-import { normalizeOpenAiContent } from "./openai-content.mjs";
+import { countOmittedMedia, normalizeOpenAiContent } from "./openai-content.mjs";
 import {
   buildToolCallDeltas,
   parseToolEmulationSetting,
@@ -787,6 +787,7 @@ function logRequestTranslation({
   toolEmulation = null,
   toolOverrides = [],
   nullBytesReplaced = 0,
+  mediaOmitted = 0,
 }) {
   const parts = [
     `model=${JSON.stringify(requestedModel ?? "")}`,
@@ -814,6 +815,10 @@ function logRequestTranslation({
   }
   if (nullBytesReplaced > 0) {
     parts.push(`null_bytes_replaced=${nullBytesReplaced}`);
+  }
+  if (mediaOmitted > 0) {
+    // Images, files and audio replaced with a note; see openai-content.mjs.
+    parts.push(`media_omitted=${mediaOmitted}`);
   }
   if (options.enableLargeContextChat) {
     parts.push("large_context=on");
@@ -909,6 +914,7 @@ function buildVeniceChatOptions({
     toolEmulation,
     toolOverrides,
     nullBytesReplaced: nullBytes.replaced,
+    mediaOmitted: countOmittedMedia(payload?.messages),
   });
 
   return options;
