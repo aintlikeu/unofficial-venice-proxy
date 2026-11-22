@@ -20,6 +20,8 @@ const CALL_TAGS = [
   { open: PROXY_OPEN_TAG, close: PROXY_CLOSE_TAG, wrapper: true },
   { open: "<function=", close: "</function>", wrapper: false },
 ];
+// A complete wrapper opening tag at the start of the text.
+const WRAPPER_OPEN_RE = /^<(?:tool_call|proxy_call)\s*>/;
 
 // DeepSeek's native call syntax (DSML). One call is
 //   <|tool▁call▁begin|>function<|tool▁sep|>NAME
@@ -1790,6 +1792,18 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       if (currentTag.wrapper && !currentTag.complete && !currentTag.dynamic) {
         const inner = buffer.trimStart();
         if (DSML_XML_INVOKE_VARIANTS.some((open) => inner.startsWith(open))) {
+          buffer = inner;
+          openTagText = "";
+          mode = "text";
+          continue;
+        }
+        // A wrapper opened twice, the call inside the second one (seen live,
+        // deepseek-v4-1-flash 1017 in the proxy format, from hermes):
+        //   <proxy_call>
+        //   <proxy_call>{"name": "terminal", …}</proxy_call>
+        // The outer tag is dropped and the inner one opens the call; a stray
+        // closer after it is skipped like any wrapper closer after a call.
+        if (WRAPPER_OPEN_RE.test(inner)) {
           buffer = inner;
           openTagText = "";
           mode = "text";

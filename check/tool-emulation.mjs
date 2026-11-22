@@ -862,6 +862,32 @@ function testProxyFormat() {
   ok("…and a tool_call still works next to it",
     feed('<tool_call>{"name":"get_weather","arguments":{"city":"x"}}</tool_call>').calls.length === 1);
   ok("look-alike <proxy_calls> stays text", feed("a <proxy_calls> b").text === "a <proxy_calls> b");
+
+  // Seen live from hermes (deepseek-v4-1-flash 1017): the wrapper opened twice.
+  const doubled = '\n\n<proxy_call>\n<proxy_call>{"name":"get_weather","arguments":{"city":"Paris","units":"c"}}</proxy_call>';
+  for (const chunkSize of [Infinity, 1]) {
+    const parsed = feed(doubled, { chunkSize });
+    ok(`doubled <proxy_call> gives one call (chunk ${chunkSize})`,
+      parsed.calls.length === 1 && parsed.calls[0].function.name === "get_weather" &&
+        parsed.calls[0].function.arguments === '{"city":"Paris","units":"c"}' && parsed.text === "" && !parsed.events.some((event) => event.type === "invalid"),
+      JSON.stringify(parsed));
+  }
+  const mixedWrappers = feed('Look.\n<tool_call>\n<proxy_call >{"name":"get_weather","arguments":{"city":"x"}}</proxy_call></tool_call>\nDone.', { chunkSize: 1 });
+  ok("<tool_call> around <proxy_call>: one call, stray closer skipped",
+    mixedWrappers.calls.length === 1 && mixedWrappers.text === "Look." && !mixedWrappers.events.some((event) => event.type === "invalid"), JSON.stringify(mixedWrappers));
+  const tripled = feed('<proxy_call><proxy_call>\n<proxy_call>{"name":"get_weather","arguments":{"city":"x"}}</proxy_call>');
+  ok("a wrapper opened three times still gives one call", tripled.calls.length === 1 && !tripled.events.some((event) => event.type === "invalid"));
+  const unterminated = feed('<proxy_call>\n<proxy_call>{"name":"get_weather","arguments":{"city":"x"}}');
+  ok("doubled and unclosed at the end parses like a single unclosed tag",
+    unterminated.calls.length === feed('<proxy_call>{"name":"get_weather","arguments":{"city":"x"}}').calls.length);
+  const empty = feed("<proxy_call>\n<proxy_call>");
+  const invalid = (parsed) => parsed.events.filter((event) => event.type === "invalid");
+  ok("two empty openers stay an invalid call, no call",
+    empty.calls.length === 0 && invalid(empty).length === 1 && /missing tool name/.test(invalid(empty)[0].reason), JSON.stringify(empty));
+  const lookAlike = feed("<proxy_call>\n<proxy_calls>x</proxy_calls>");
+  ok("an inner look-alike tag is not taken for a second opener",
+    lookAlike.calls.length === 0 && invalid(lookAlike).length === 1 && invalid(lookAlike)[0].raw === "<proxy_call>\n<proxy_calls>x</proxy_calls>",
+    JSON.stringify(lookAlike));
 }
 
 // "$$", "$&" and friends are special in String.prototype.replace replacement
