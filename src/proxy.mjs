@@ -58,6 +58,10 @@ const TOOL_REASONING_BUDGET = parseReasoningBudget(process.env.VENICE_TOOL_REASO
 const LARGE_CONTEXT_ENABLED = !["off", "0", "false", "no"].includes(
   process.env.VENICE_LARGE_CONTEXT?.trim().toLowerCase() ?? "",
 );
+// How long /v1/models reuses the fetched catalog (ms; 0 = fetch on every call).
+// A fetch takes 0.7-7 s, while Hermes gives /v1/models 3 s when it sizes its
+// context window.
+const MODELS_CACHE_MS = parseCacheMs(process.env.VENICE_MODELS_CACHE_MS, 60_000);
 // Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
 const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
 if (TOOL_FORMAT_RULES.invalid.length > 0) {
@@ -645,6 +649,12 @@ function updateStreamStats(stats, event) {
   }
 }
 
+function parseCacheMs(value, fallback) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  const parsed = Number(trimmed);
+  return trimmed !== "" && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 // The model's context window from the catalog (maxContextLength) as
 // context_length, which clients such as Hermes read from /v1/models to decide
 // when to compact. Left out when the catalog has no usable number, so a client
@@ -915,6 +925,11 @@ class VeniceOpenAiProxy {
     // by every id a caller might use (canonical, api, aliases).
     this.modelSettings = new Map();
     this.modelSettingsLoadedAt = 0;
+    // The last catalog fetched, reused by /v1/models (see MODELS_CACHE_MS), and
+    // the fetch in flight, shared by concurrent callers.
+    this.catalog = null;
+    this.catalogFetchedAt = 0;
+    this.catalogPromise = null;
   }
 
   buildMissingSessionError() {
@@ -1090,17 +1105,48 @@ class VeniceOpenAiProxy {
     return this.modelSettings.get(model) ?? null;
   }
 
+  // Fetches the catalog from Venice; concurrent callers share one fetch.
   async fetchTextModels() {
-    const models = await this.callWithAuth(
-      async (auth) =>
-        await this.client.getTextModels(auth.login.clerkJwt, {
-          matureFilter: false,
-          onlySafeVenice: false,
-        }),
-      { label: "models", model: "n/a" },
-    );
-    this.cacheModelSettings(models);
-    return models;
+    this.catalogPromise ??= (async () => {
+      try {
+        const models = await this.callWithAuth(
+          async (auth) =>
+            await this.client.getTextModels(auth.login.clerkJwt, {
+              matureFilter: false,
+              onlySafeVenice: false,
+            }),
+          { label: "models", model: "n/a" },
+        );
+        this.cacheModelSettings(models);
+        this.catalog = models;
+        this.catalogFetchedAt = Date.now();
+        return models;
+      } finally {
+        this.catalogPromise = null;
+      }
+    })();
+    return await this.catalogPromise;
+  }
+
+  // The catalog for /v1/models: a copy younger than MODELS_CACHE_MS is reused,
+  // and the last good copy is served when a refetch fails.
+  async getTextModelsCached() {
+    if (this.catalog && Date.now() - this.catalogFetchedAt < MODELS_CACHE_MS) {
+      return this.catalog;
+    }
+    try {
+      return await this.fetchTextModels();
+    } catch (error) {
+      if (!this.catalog) {
+        throw error;
+      }
+      console.warn(
+        `[${nowIso()}] model catalog refresh failed; serving the copy from ${new Date(this.catalogFetchedAt).toISOString()}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return this.catalog;
+    }
   }
 
   async refreshModelSettings() {
@@ -1113,7 +1159,7 @@ class VeniceOpenAiProxy {
 
   async getModels(options = {}) {
     const { onlyFree = false } = options || {};
-    const models = await this.fetchTextModels();
+    const models = await this.getTextModelsCached();
     const data = models
       .filter(
         (model) =>
@@ -1159,6 +1205,12 @@ class VeniceOpenAiProxy {
       });
     }
     return data;
+  }
+
+  // One entry of the /v1/models list by its exact id, or null.
+  async getModel(id, options = {}) {
+    const models = await this.getModels(options);
+    return models.find((model) => model.id === id) ?? null;
   }
 
   async chatCompletions(payload) {
@@ -1545,6 +1597,34 @@ export function createVeniceOpenAiProxyServer(
           status: 200,
           durationMs: Date.now() - startedAt,
         });
+        return;
+      }
+
+      // One model of the /v1/models list (OpenAI's "retrieve model").
+      const modelPath = /^\/(?:v1\/)?models\/(.+)$/.exec(url.pathname);
+      if (req.method === "GET" && modelPath) {
+        logIncomingRequest(req, url, 0);
+        let id;
+        try {
+          id = decodeURIComponent(modelPath[1]);
+        } catch {
+          id = modelPath[1];
+        }
+        const model = await proxy.getModel(id, { onlyFree: true });
+        const status = model ? 200 : 404;
+        json(
+          res,
+          status,
+          model ?? {
+            error: {
+              message: `The model '${id}' does not exist or is not served by this proxy.`,
+              type: "invalid_request_error",
+              param: "model",
+              code: "model_not_found",
+            },
+          },
+        );
+        logOutgoingResponse({ req, url, status, durationMs: Date.now() - startedAt });
         return;
       }
 

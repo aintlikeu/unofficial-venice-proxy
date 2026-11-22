@@ -6,7 +6,7 @@ This project exposes the Venice web app as an OpenAI-compatible API so tools lik
 
 It currently provides:
 
-- `GET /v1/models`
+- `GET /v1/models` and `GET /v1/models/{id}`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - streaming chat completions
@@ -165,7 +165,9 @@ The response includes the logged-in account's email, so keep the endpoint on a t
 
 ### Model sampling defaults
 
-Venice's web client sends a per-model `temperature` and `topP` with every message; the values live in the model catalog (`GET /api/app/encrypted_models`, inside the returned JWT as `text.models[].settings`). To keep proxy output reproducible against the web UI, the proxy loads that catalog at startup and caches the defaults, re-caching them whenever `/v1/models` is called.
+Venice's web client sends a per-model `temperature` and `topP` with every message; the values live in the model catalog (`GET /api/app/encrypted_models`, inside the returned JWT as `text.models[].settings`). To keep proxy output reproducible against the web UI, the proxy loads that catalog at startup and caches the defaults, re-caching them whenever `/v1/models` fetches the catalog again.
+
+`/v1/models` reuses a fetched catalog for 60 seconds (`VENICE_MODELS_CACHE_MS`, in milliseconds; `0` fetches on every call). A fetch takes 0.7 to 7 seconds, and Hermes gives the endpoint 3 seconds when it sizes its context window. Concurrent calls share one fetch, and when a refetch fails the proxy logs `model catalog refresh failed` and serves the last good copy. `GET /v1/models/{id}` returns one entry of the same list, or a 404 with `code: "model_not_found"`.
 
 A request that sets `temperature` or `top_p` always wins; anything it omits falls back to the catalog value for that model. The translation log says which is which:
 
@@ -173,7 +175,7 @@ A request that sets `temperature` or `top_p` always wins; anything it omits fall
 translate model="aion-labs-aion-3-0-mini" venice_model=aion-labs-aion-3-0-mini reasoning=true(model-default) venice_params={} temperature=0.6(catalog) top_p=0.9(catalog) messages=1
 ```
 
-If the catalog can't be fetched at startup the proxy logs a warning and still serves; requests then fall back to Venice's own server-side defaults until the next `/v1/models` call.
+If the catalog can't be fetched at startup the proxy logs a warning and still serves; requests then fall back to Venice's own server-side defaults until `/v1/models` next fetches the catalog.
 
 ### Context size, usage and "prompt too long"
 

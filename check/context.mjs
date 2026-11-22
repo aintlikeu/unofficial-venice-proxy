@@ -491,12 +491,159 @@ async function testModelsList() {
   ok("paid model listed with its window when not filtered", all.find((model) => model.id === "paid")?.context_length === 128000);
 }
 
+// /v1/models reuses the catalog for VENICE_MODELS_CACHE_MS (Hermes gives the
+// endpoint 3 s, a Venice fetch takes up to ~7 s), shares one fetch between
+// concurrent callers and serves the last good copy when a refetch fails.
+// /v1/models/{id} answers one entry of the same list.
+async function testModelsCache() {
+  section("/v1/models cache and /v1/models/{id}");
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const warnings = [];
+  // Drop the proxy's own [timestamp] log lines; keep PASS/FAIL output.
+  console.log = (...args) => {
+    if (!String(args[0]).startsWith("[")) {
+      originalLog(...args);
+    }
+  };
+  console.warn = (...args) => warnings.push(args.join(" "));
+  const proxy = createVeniceOpenAiProxy();
+  proxy.ensureAuth = async () => ({ login: { clerkJwt: "jwt" } });
+  let fetches = 0;
+  let failWith = null;
+  let release = null;
+  let catalog = [{ id: "deepseek-v4-1-flash", type: "text", usesCredits: false, maxContextLength: 1000000 }];
+  proxy.client.getTextModels = async () => {
+    fetches += 1;
+    if (release) {
+      await release;
+    }
+    if (failWith) {
+      throw failWith;
+    }
+    return catalog;
+  };
+  const server = createVeniceOpenAiProxyServer(proxy);
+  try {
+    let unblock;
+    release = new Promise((resolve) => {
+      unblock = resolve;
+    });
+    const concurrent = Promise.all([proxy.getModels({ onlyFree: true }), proxy.getModels(), proxy.getModels()]);
+    unblock();
+    await concurrent;
+    release = null;
+    ok("concurrent calls share one fetch", fetches === 1, String(fetches));
+
+    await proxy.getModels();
+    ok("a fresh copy is reused", fetches === 1, String(fetches));
+
+    catalog = [...catalog, { id: "zai-org-glm-5-2", type: "text", usesCredits: false, maxContextLength: 1000000 }];
+    proxy.catalogFetchedAt -= 61_000;
+    const refreshed = await proxy.getModels();
+    ok("an expired copy is fetched again", fetches === 2 && refreshed.some((model) => model.id === "zai-org-glm-5-2"), String(fetches));
+
+    failWith = new Error("HTTP 502: upstream down");
+    proxy.catalogFetchedAt -= 61_000;
+    const stale = await proxy.getModels();
+    ok("a failed refetch serves the last good copy", stale.length === refreshed.length && fetches === 3, String(fetches));
+    ok("…and logs it", warnings.some((line) => line.includes("model catalog refresh failed") && line.includes("upstream down")));
+    failWith = null;
+
+    const startup = await proxy.refreshModelSettings();
+    ok("startup refresh always fetches", fetches === 4 && startup.size > 0, String(fetches));
+
+    const cold = createVeniceOpenAiProxy();
+    cold.ensureAuth = proxy.ensureAuth;
+    cold.client.getTextModels = async () => {
+      throw new Error("HTTP 502: upstream down");
+    };
+    let coldError = null;
+    try {
+      await cold.getModels();
+    } catch (error) {
+      coldError = error;
+    }
+    ok("no copy yet: the error propagates", coldError?.message === "HTTP 502: upstream down");
+
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const get = async (path) => {
+      const response = await fetch(`${base}${path}`);
+      return { status: response.status, body: await response.json() };
+    };
+    const one = await get("/v1/models/deepseek-v4-1-flash");
+    ok(
+      "GET /v1/models/{id} → that entry",
+      one.status === 200 && one.body.id === "deepseek-v4-1-flash" && one.body.context_length === 1000000 && one.body.object === "model",
+      JSON.stringify(one),
+    );
+    const bare = await get("/models/zai-org-glm-5-2");
+    ok("GET /models/{id} works too", bare.status === 200 && bare.body.id === "zai-org-glm-5-2", JSON.stringify(bare));
+    const missing = await get("/v1/models/no-such-model");
+    ok(
+      "unknown id → 404 model_not_found",
+      missing.status === 404 && missing.body.error?.code === "model_not_found" && missing.body.error?.param === "model",
+      JSON.stringify(missing),
+    );
+    const encoded = await get("/v1/models/deepseek-v4-1-flash%2Fx");
+    ok("encoded slash is part of the id", encoded.status === 404 && encoded.body.error?.message.includes("deepseek-v4-1-flash/x"), JSON.stringify(encoded));
+    const malformed = await get("/v1/models/%E0%A4%A");
+    ok("malformed escape → 404, not 500", malformed.status === 404, JSON.stringify(malformed));
+    const list = await get("/v1/models");
+    const listed = (list.body.data ?? []).map((model) => model.id);
+    ok(
+      "list still served",
+      list.status === 200 && list.body.object === "list" && listed.includes("deepseek-v4-1-flash") && listed.includes("zai-org-glm-5-2"),
+      listed.join(","),
+    );
+    ok("HTTP calls reused the cache", fetches === 4, String(fetches));
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    await new Promise((resolve) => (server.listening ? server.close(resolve) : resolve()));
+  }
+}
+
+function testModelsCacheEnv() {
+  section("VENICE_MODELS_CACHE_MS");
+  const script = `
+    import { createVeniceOpenAiProxy } from "./src/proxy.mjs";
+    const proxy = createVeniceOpenAiProxy();
+    proxy.ensureAuth = async () => ({ login: { clerkJwt: "jwt" } });
+    let fetches = 0;
+    proxy.client.getTextModels = async () => { fetches += 1; return [{ id: "m", type: "text", usesCredits: false }]; };
+    await proxy.getModels();
+    await proxy.getModels();
+    process.stdout.write(JSON.stringify({ fetches }));
+  `;
+  const run = (value) => {
+    const env = { ...process.env };
+    if (value === undefined) {
+      delete env.VENICE_MODELS_CACHE_MS;
+    } else {
+      env.VENICE_MODELS_CACHE_MS = value;
+    }
+    const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: new URL("..", import.meta.url),
+      env,
+      encoding: "utf8",
+    });
+    return JSON.parse(output.slice(output.lastIndexOf("{"))).fetches;
+  };
+  ok("default: second call cached", run(undefined) === 1);
+  ok("0 fetches every call", run("0") === 2);
+  ok("invalid values keep the default", run("abc") === 1 && run("-5") === 1 && run("") === 1);
+}
+
 async function main() {
   testHelpers();
   testFoldHelpers();
   await testProxy();
   await testClientBody();
   await testModelsList();
+  await testModelsCache();
+  testModelsCacheEnv();
   testEnvOff();
   console.log(`\n${"─".repeat(40)}`);
   console.log(`Results: ${passed} passed, ${failed} failed`);
