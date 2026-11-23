@@ -2071,11 +2071,14 @@ export function buildEmptyRetryMessages(emulation) {
 // { type: "meta" | "reasoning" | "text" | "tool_call" | "error" }.
 //
 // Reading stops as soon as the reply is complete, so the model cannot go on
-// with "let me fix that". One retry covers two failures, before anything
+// with "let me fix that". One retry covers three failures, before anything
 // about them reaches the client:
 // - an unparsed call block (before any call): the model gets its raw reply
 //   back with a correction; text from that retry is not shown, and if it fails
 //   too the original block comes back as text;
+// - an empty reply (no text, no call): asked again with the format repeated.
+//   If any retry comes back empty, a retryable "error" event (empty_reply)
+//   ends the reply, so the client asks again rather than stopping;
 // - a reasoning overrun: more than reasoningBudget characters of reasoning
 //   before any answer text or call. The request is cancelled and asked again
 //   with a nudge to be brief and with reasoning off (openAttempt gets
@@ -2192,15 +2195,8 @@ export async function* runToolEmulation({
       }
       failure = { reason: "the retry contained no tool call", raw: output };
     }
-    if (empty && !retrying) {
+    if (empty) {
       failure = { empty: true, reason: "the reply was empty", raw: "" };
-    } else if (empty) {
-      // Nothing arrived twice: report it and end with the empty reply.
-      onEvent({ type: "failed", reason: `${firstFailure.reason}; retry: the reply was empty`, outputs: [firstFailure.output].filter(Boolean) });
-      if (blank && showText) {
-        yield { type: "text", text: blank };
-      }
-      return;
     }
     if (!retrying) {
       firstFailure = { ...failure, output };
@@ -2223,7 +2219,18 @@ export async function* runToolEmulation({
       outputs: [firstFailure.output, output].filter(Boolean),
     });
     const fallback = firstFailure.raw || failure.raw;
-    if (fallback) {
+    if (failure.empty) {
+      // An empty reply is never an answer while tools are offered: passed on
+      // as one, the client took it as the end of the task and stopped (seen
+      // with deepseek-v4-1-flash 1017, whose native DSML calls Venice cuts out
+      // of the stream). A retryable error makes the client ask again instead.
+      yield {
+        type: "error",
+        code: "empty_reply",
+        retryable: true,
+        message: `The model returned an empty reply (no text and no tool call) ${firstFailure.empty ? "twice" : `after ${firstFailure.reason}`}; the proxy already retried once. Retrying the request may succeed.`,
+      };
+    } else if (fallback) {
       yield { type: "text", text: fallback };
     } else {
       yield {

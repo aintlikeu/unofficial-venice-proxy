@@ -1445,11 +1445,13 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       }
     }
     if (failure) {
-      json(res, 504, { error: { message: failure.message, type: "server_error", code: failure.code } });
+      // 502 for an empty reply (worth retrying), 504 for a reasoning overrun.
+      const status = failure.retryable ? 502 : 504;
+      json(res, status, { error: { message: failure.message, type: "server_error", code: failure.code } });
       logOutgoingResponse({
         req,
         url,
-        status: 504,
+        status,
         model,
         contentLength: stats.contentLength,
         reasoningLength: stats.reasoningLength,
@@ -1537,11 +1539,19 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       // invalid_request_error is the only error type that stops opencode's
       // retry loop: with server_error or model_error it re-sent the request
       // about ten times (opencode 2.2.3). The proxy has already spent its own
-      // retry, so more rounds would only repeat the overrun for minutes.
-      const error = { message: streamError.message, type: "invalid_request_error", code: streamError.code };
-      const status = res.headersSent ? 200 : 504;
+      // retry, so more rounds would only repeat the overrun for minutes. An
+      // empty reply is the opposite: each round takes seconds and often
+      // succeeds, so it goes out as server_error, which opencode 2.3.2 retried
+      // ten times with backoff (about 80 s), mid-stream and as a 502 alike.
+      const error = {
+        message: streamError.message,
+        type: streamError.retryable ? "server_error" : "invalid_request_error",
+        code: streamError.code,
+      };
+      const failureStatus = streamError.retryable ? 502 : 504;
+      const status = res.headersSent ? 200 : failureStatus;
       if (!res.headersSent) {
-        json(res, 504, { error });
+        json(res, failureStatus, { error });
       } else {
         // OpenAI-style mid-stream error: clients raise it instead of waiting.
         writeSseChunk(res, { error });

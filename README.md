@@ -475,8 +475,14 @@ How it works:
    back as plain text. Both raw outputs are logged (`tool emulation:` warnings, truncated to
    4,000 characters). An unparsable block after a valid call is dropped. A reply with no
    text and no call is retried the same way, with the call format repeated on the latest
-   user turn. Non-streaming requests work the same way: the proxy reads the upstream as a
-   stream internally.
+   user turn. If a retry comes back empty (after an empty reply or an unparsable block),
+   the client gets a retryable error, not an empty answer: an empty answer ended the task in
+   opencode mid-way. Non-streaming requests get HTTP 502 with `code: "empty_reply"`; streaming
+   ones an OpenAI-style `{"error": …}` chunk of type `server_error` and `[DONE]` (a plain 502
+   if nothing was sent yet). opencode 2.3.2 retried both up to ten times with backoff (about
+   80 s in all) and only then showed the error. This is the opposite of the reasoning-budget
+   error below, which must stop opencode's retries. Non-streaming requests work the same
+   way: the proxy reads the upstream as a stream internally.
 
 `tool_choice` is honored in the prompt: `"auto"` (default), `"required"` (must call at least
 one tool), `{"type":"function","function":{"name":"X"}}` (must call `X`), and `"none"`, which
@@ -556,7 +562,11 @@ a template literal, and a multi-file search.
   raw response came back with the block missing and nothing in its place), so with `json`
   most replies were empty: 35/80, with 115 of 156 upstream replies empty. The `proxy`
   format, whose rules say other tool-call syntax is removed, brings it to 77/80: two runs
-  stayed empty after the retry and one dropped backslashes in the file. The same format
+  stayed empty after the retry and one dropped backslashes in the file. In November 2026
+  Venice moved this id to the 1017 build, and empty replies became common again: on a
+  hermes-like prompt 4 of 6 first attempts were empty and 1 of 6 stayed empty after the
+  retry (the uncensored build: 10/10 at the first attempt). Such a request now ends in the
+  retryable `empty_reply` error described above instead of an empty answer. The same format
   on the uncensored build scored 79/80 too but kept fewer trailing newlines (74/79), so that
   one stays on `json`. Turning reasoning off made both formats worse.
 - Qwen 3.8 can get stuck reasoning; the reasoning budget below stops it.

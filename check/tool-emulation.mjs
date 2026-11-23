@@ -1258,9 +1258,30 @@ async function testEmptyReplies() {
   ok("empty, then a plain answer: the answer is returned", answered.text === "It is sunny." && answered.calls.length === 0);
 
   const twice = await collect(emulation, [["\n"], [" \n"]]);
-  ok("empty twice: ends empty, logged as failed, nothing else sent",
-    twice.stats.attempts === 2 && twice.calls.length === 0 && !twice.events.some((event) => event.type === "error") &&
-      twice.reports.at(-1)?.type === "failed" && /reply was empty/.test(twice.reports.at(-1).reason));
+  const twiceError = twice.events.find((event) => event.type === "error");
+  ok("empty twice: a retryable empty_reply error, logged as failed, no text or call",
+    twice.stats.attempts === 2 && twice.calls.length === 0 && twice.text === "" &&
+      twiceError?.code === "empty_reply" && twiceError.retryable === true && /empty reply .*twice/.test(twiceError.message) &&
+      twice.events.at(-1) === twiceError &&
+      twice.reports.at(-1)?.type === "failed" && /reply was empty; retry: the reply was empty/.test(twice.reports.at(-1).reason),
+    JSON.stringify({ events: twice.events, reports: twice.reports }));
+
+  // Seen live from hermes: a bad call block, then an empty retry. The block
+  // used to come back as the answer; it is not one.
+  const badThenEmpty = await collect(emulation, [['<proxy_call>\n<proxy_call>'], [""]]);
+  const badThenEmptyError = badThenEmpty.events.find((event) => event.type === "error");
+  ok("unparsed call, then empty: the same error, not the broken block as text",
+    badThenEmptyError?.code === "empty_reply" && /after .*missing tool name/.test(badThenEmptyError.message) &&
+      badThenEmpty.text === "" && badThenEmpty.calls.length === 0, JSON.stringify(badThenEmpty.events));
+
+  const reasoningThenEmpty = await collect(emulation, [[{ type: "reasoning", text: "I should call get_weather." }], [{ type: "reasoning", text: "Calling it." }]]);
+  ok("empty with reasoning only, twice: the reasoning streams, then the error",
+    reasoningThenEmpty.events.filter((event) => event.type === "reasoning").length === 2 &&
+      reasoningThenEmpty.events.at(-1)?.code === "empty_reply", JSON.stringify(reasoningThenEmpty.events));
+
+  const unparsedTwice = await collect(emulation, [['<proxy_call>{"name": "nope"}</proxy_call>'], ['<proxy_call>{"name": "nope2"}</proxy_call>']]);
+  ok("unparsed twice still falls back to the block as text, no error",
+    unparsedTwice.text.includes('"nope"') && !unparsedTwice.events.some((event) => event.type === "error"), JSON.stringify(unparsedTwice.events));
 
   const plain = await collect(emulation, [["It is sunny.\n\n"]]);
   ok("a real answer is not retried and keeps its trailing whitespace", plain.stats.attempts === 1 && plain.text === "It is sunny.\n\n");
@@ -1569,6 +1590,37 @@ async function testProxyWiring() {
         overrunStream.at(-2)?.error?.code === "reasoning_budget_exceeded" &&
         overrunStream.at(-2)?.error?.type === "invalid_request_error" && overrunStream.at(-1) === "[DONE]" &&
         !overrunStream.some((chunk) => chunk.choices?.[0]?.finish_reason));
+
+    // Empty twice (deepseek-v4-1-flash 1017 live): a retryable error, never an
+    // empty "answer" the client would take as the end of the task.
+    chatEvents = [
+      { kind: "meta", servingModelId: "deepseek-v4-1-flash" },
+      { kind: "content", reasoning_content: "I will call get_weather." },
+      { kind: "content", content: "\n\n" },
+    ];
+    logs.length = 0;
+    chatStreamCalls.length = 0;
+    const emptyJson = await post({ model: "deepseek-v4-1-flash", messages: history, tools: [WEATHER_TOOL] });
+    const emptyError = JSON.parse(emptyJson.text).error;
+    ok("empty twice, non-stream: 502 empty_reply, server_error, two upstream attempts",
+      emptyJson.status === 502 && emptyError?.code === "empty_reply" && emptyError?.type === "server_error" &&
+        /twice/.test(emptyError.message) && chatStreamCalls.length === 2, `${emptyJson.status} ${emptyJson.text.slice(0, 300)}`);
+    ok("empty twice: failure logged, outgoing status 502",
+      logs.some((line) => line.includes("retry failed too") && line.includes("the reply was empty")) &&
+        logs.some((line) => line.includes(" outgoing ") && line.includes("status=502") && line.includes("tool_attempts=2")),
+      logs.filter((line) => line.includes(" outgoing ")).join(" | "));
+    const emptyStream = parseSse((await post({ model: "deepseek-v4-1-flash", stream: true, messages: history, tools: [WEATHER_TOOL] })).text);
+    ok("empty twice, stream: reasoning streamed, then a server_error chunk (retryable) and [DONE]",
+      emptyStream.some((chunk) => chunk.choices?.[0]?.delta?.reasoning_content) &&
+        emptyStream.at(-2)?.error?.code === "empty_reply" && emptyStream.at(-2)?.error?.type === "server_error" &&
+        emptyStream.at(-1) === "[DONE]" && !emptyStream.some((chunk) => chunk.choices?.[0]?.finish_reason) &&
+        !emptyStream.some((chunk) => chunk.choices?.[0]?.delta?.content),
+      JSON.stringify(emptyStream.slice(-3)));
+    chatEvents = [{ kind: "meta", servingModelId: "deepseek-v4-1-flash" }, { kind: "content", content: "\n" }];
+    const emptyNoReasoning = await post({ model: "deepseek-v4-1-flash", stream: true, messages: history, tools: [WEATHER_TOOL] });
+    ok("empty twice, stream, nothing sent yet: a plain 502",
+      emptyNoReasoning.status === 502 && JSON.parse(emptyNoReasoning.text).error?.code === "empty_reply",
+      `${emptyNoReasoning.status} ${emptyNoReasoning.text.slice(0, 200)}`);
 
     // Junk after the call: the reply ends, the upstream is cancelled, it is logged.
     chatEvents = [
