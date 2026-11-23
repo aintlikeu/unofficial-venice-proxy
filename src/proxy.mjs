@@ -35,6 +35,9 @@ const MODEL_OVERLOADED_MAX_RETRIES = Number(
 const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
   process.env.VENICE_MODEL_OVERLOADED_RETRY_DELAY_MS || 750,
 );
+// Pause before retrying a request whose connection failed (see
+// isUpstreamConnectionError).
+const CONNECTION_RETRY_DELAY_MS = 500;
 const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
 // Clerk JWTs live about a minute; refresh a little before they lapse.
 const AUTH_REFRESH_SKEW_MS = Number(process.env.VENICE_AUTH_REFRESH_SKEW_MS || 10_000);
@@ -362,6 +365,16 @@ function isModelOverloadedError(error) {
 
 function isUnauthorizedError(error) {
   return error instanceof Error && error.message.startsWith("HTTP 401:");
+}
+
+// The request to Venice failed before any response arrived, e.g.
+//   POST https://outerface.venice.ai/api/inference/chat: error sending request
+//   for uri (…): client error (SendRequest): http2 error: stream error received:
+//   unspecific protocol error detected
+// Seen in bursts that failed every request in flight at once, 25-40 s after
+// they were sent. Nothing has reached the client yet, so one retry is safe.
+function isUpstreamConnectionError(error) {
+  return error instanceof Error && /error sending request for uri/i.test(error.message);
 }
 
 async function retryModelOverloaded(operation, { label, model }) {
@@ -936,6 +949,9 @@ class VeniceOpenAiProxy {
     this.catalog = null;
     this.catalogFetchedAt = 0;
     this.catalogPromise = null;
+    // Requests the server is handling right now, logged with upstream
+    // connection failures to show how many requests a failure hit at once.
+    this.inFlight = 0;
   }
 
   buildMissingSessionError() {
@@ -1042,24 +1058,49 @@ class VeniceOpenAiProxy {
   }
 
   // Runs an upstream call with a cached JWT, retrying once on 401 in case the
-  // session was revoked or expired between the cache check and the request.
+  // session was revoked or expired between the cache check and the request,
+  // and once on a new connection when the request never got a response (see
+  // isUpstreamConnectionError).
   async callWithAuth(operation, { label, model }) {
     let retriedUnauthorized = false;
+    let retriedConnection = false;
+    const run = async (attempt) => {
+      const auth = await this.ensureAuth();
+      try {
+        return await operation(auth, attempt);
+      } catch (error) {
+        if (retriedUnauthorized || !isUnauthorizedError(error)) {
+          throw error;
+        }
+        retriedUnauthorized = true;
+        console.warn(
+          `[${nowIso()}] upstream rejected cached session; refreshing auth and retrying ${label}`,
+        );
+        this.invalidateAuth();
+        return await operation(await this.ensureAuth(), attempt);
+      }
+    };
     return await retryModelOverloaded(
       async (attempt) => {
-        const auth = await this.ensureAuth();
+        const generation = this.client.transportGeneration;
+        const startedAt = Date.now();
         try {
-          return await operation(auth, attempt);
+          return await run(attempt);
         } catch (error) {
-          if (retriedUnauthorized || !isUnauthorizedError(error)) {
+          if (retriedConnection || !isUpstreamConnectionError(error)) {
             throw error;
           }
-          retriedUnauthorized = true;
+          retriedConnection = true;
+          // Only the first of several requests that failed together on one
+          // connection replaces it; the others retry on that new connection.
+          const rotated = this.client.rotateTransport?.(generation) ?? false;
           console.warn(
-            `[${nowIso()}] upstream rejected cached session; refreshing auth and retrying ${label}`,
+            `[${nowIso()}] upstream connection failed after ${Date.now() - startedAt} ms in_flight=${this.inFlight}; retrying ${label} once on a ${rotated ? "new" : "renewed"} connection model=${model}: ${error.message}`,
           );
-          this.invalidateAuth();
-          return await operation(await this.ensureAuth(), attempt);
+          if (CONNECTION_RETRY_DELAY_MS > 0) {
+            await sleep(CONNECTION_RETRY_DELAY_MS);
+          }
+          return await run(attempt);
         }
       },
       { label, model },
@@ -1555,6 +1596,10 @@ export function createVeniceOpenAiProxyServer(
 ) {
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
+    proxy.inFlight += 1;
+    res.once("close", () => {
+      proxy.inFlight -= 1;
+    });
     applyCorsHeaders(req, res);
     try {
       const url = new URL(
@@ -2261,19 +2306,24 @@ export function createVeniceOpenAiProxyServer(
         logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
         return;
       }
+      // A request Venice never answered is a bad gateway, not a proxy bug:
+      // 502 tells clients the failure is upstream and worth retrying.
+      const upstream = isUpstreamConnectionError(error);
+      const status = upstream ? 502 : 500;
       console.warn(
-        `[${nowIso()}] request failed: ${req.method} ${url.pathname} ${error instanceof Error ? error.message : String(error)}`,
+        `[${nowIso()}] request failed: ${req.method} ${url.pathname} in_flight=${proxy.inFlight} ${error instanceof Error ? error.message : String(error)}`,
       );
-      json(res, 500, {
+      json(res, status, {
         error: {
           message: error instanceof Error ? error.message : String(error),
           type: "server_error",
+          ...(upstream ? { code: "upstream_connection_error" } : {}),
         },
       });
       logOutgoingResponse({
         req,
         url,
-        status: 500,
+        status,
         durationMs: Date.now() - startedAt,
       });
     }

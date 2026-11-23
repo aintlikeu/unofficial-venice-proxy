@@ -45,6 +45,7 @@ Main scripts in this repo:
 - `check/models.mjs`: quick `/v1/models` smoke test (`npm run check:models`)
 - `check/openai.mjs`: test run against a running proxy with the official `openai` client (`npm run check:openai-client`)
 - `check/concurrency.mjs`: parallel streaming test (`npm run check:concurrency`)
+- `check/upstream.mjs`: offline check of the retry on upstream connection failures and the 502 (`npm run check:upstream`)
 - `docker-compose.example.yml`: example Compose setup
 
 ## Local setup
@@ -202,6 +203,8 @@ In opencode, the models of a custom provider are listed in its config; give each
 ### HTTP transport
 
 Cloudflare rejects plain Node `fetch` on the Venice inference endpoints (`POST /api/inference/chat` returns a 403 challenge page), so the client sends every request through a `wreq-js` session with a Chrome TLS/HTTP fingerprint. Set `VENICE_HTTP_TRANSPORT=fetch` to force the old plain-fetch transport for debugging, and `VENICE_WREQ_BROWSER` / `VENICE_WREQ_OS` to change the impersonated profile (defaults: `chrome_131`, `macos`).
+
+A request Venice never answers (`error sending request for uri …`, e.g. `http2 error: stream error received: unspecific protocol error detected`) is retried once on a new connection, 0.5 s later, since nothing has reached the client yet. Such failures came in bursts that hit every request in flight at once, 25–40 s after they were sent (2026-11-22/23). Requests that failed together open one new connection between them, not one each; the old one stays open for 15 minutes for the replies still streaming on it, and cookies carry over. The log shows `upstream connection failed after N ms in_flight=N; retrying … once on a new connection` (or `renewed` for the requests that found it already replaced). If the retry fails too, the client gets a 502 with `code: "upstream_connection_error"` instead of a 500, so it knows the failure is upstream and worth retrying. Failures after the reply has started are not retried.
 
 You can also run the cleanup as:
 
@@ -682,6 +685,7 @@ The proxy logs:
 - `tools` and `tool_calls` counts for requests that used tool emulation, plus `tool_attempts=2` when a call was retried (the translate line also shows `tools`, `tool_choice` and `tool_format`)
 - on the translate line, `media_omitted=N` when images, files or audio were replaced with a note (see Notes and limitations), and `est_prompt_tokens` (the estimated prompt size sent to Venice) and `large_context=on` when the request opted in to the model's full context
 - total request duration
+- `in_flight` (requests being handled at that moment, the failing one included) on `request failed` and `upstream connection failed` lines
 - stream duration for streaming completions
 
 ## Notes and limitations

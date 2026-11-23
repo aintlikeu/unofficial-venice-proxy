@@ -163,6 +163,9 @@ export async function* parseSseStream(stream) {
 // VENICE_DUMP_UPSTREAM=<dir> writes every /api/inference/chat request body,
 // response headers and raw response bytes to <dir>, to see exactly what Venice
 // sends (prompts included: local debugging only).
+// How long a session replaced by rotateTransport stays open for the requests
+// still streaming on it. Venice replies take seconds to a few minutes.
+const RETIRED_SESSION_CLOSE_MS = 15 * 60_000;
 const DUMP_UPSTREAM_DIR = process.env.VENICE_DUMP_UPSTREAM?.trim() || null;
 
 function startUpstreamDump(requestBody, response) {
@@ -452,7 +455,11 @@ export class VeniceWebClient {
     // go through a wreq browser-fingerprinted session unless explicitly disabled.
     this.transport = transport === "fetch" ? "fetch" : "wreq";
     this.wreqSession = null;
+    this.wreqSessionPromise = null;
     this.wreqSeeded = false;
+    // Bumped by rotateTransport; lets callers tell whether the session they
+    // used is still the current one.
+    this.transportGeneration = 0;
     this.cookies = new CookieJar();
     this.veniceVersion = DEFAULT_VENICE_VERSION;
     this.middlefaceVersion = DEFAULT_MIDDLEFACE_VERSION;
@@ -465,7 +472,9 @@ export class VeniceWebClient {
 
   async ensureWreqSession() {
     if (!this.wreqSession) {
-      this.wreqSession = await createSession({
+      // Shared by concurrent callers, so a burst of requests (e.g. retries
+      // right after rotateTransport) opens one session, not one each.
+      this.wreqSessionPromise ??= createSession({
         browser: process.env.VENICE_WREQ_BROWSER || "chrome_131",
         os: process.env.VENICE_WREQ_OS || "macos",
         defaultHeaders: {
@@ -473,7 +482,11 @@ export class VeniceWebClient {
           accept: "*/*",
           ...BROWSER_CLIENT_HINT_HEADERS,
         },
+      }).finally(() => {
+        this.wreqSessionPromise = null;
       });
+      const session = await this.wreqSessionPromise;
+      this.wreqSession ??= session;
     }
 
     if (!this.wreqSeeded) {
@@ -515,6 +528,27 @@ export class VeniceWebClient {
             : null,
       });
     }
+  }
+
+  // Starts a new wreq session, and with it a new connection, for the requests
+  // that follow; cookies carry over. Requests still streaming on the old one
+  // keep it: it is closed only after RETIRED_SESSION_CLOSE_MS. Rotates only
+  // while `generation` is still current, so requests that failed together on
+  // one connection replace it once. Returns whether it rotated.
+  rotateTransport(generation = this.transportGeneration) {
+    if (this.transport !== "wreq" || generation !== this.transportGeneration || !this.wreqSession) {
+      return false;
+    }
+    const retired = this.wreqSession;
+    this.syncCookiesFromWreq();
+    this.wreqSession = null;
+    this.wreqSeeded = false;
+    this.transportGeneration += 1;
+    const timer = setTimeout(() => {
+      retired.close().catch(() => {});
+    }, RETIRED_SESSION_CLOSE_MS);
+    timer.unref?.();
+    return true;
   }
 
   async close() {
