@@ -1,10 +1,11 @@
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient } from "../src/client.mjs";
+import { VeniceWebClient, rateLimitWaitSeconds, upstreamHttpError } from "../src/client.mjs";
 import { createVeniceOpenAiProxy, createVeniceOpenAiProxyServer } from "../src/proxy.mjs";
 
-// Offline check of upstream connection failures: a request Venice never
-// answered is retried once on a new connection, and a second failure reaches
-// the client as a 502. Runs the proxy server with a stubbed Venice client.
+// Offline check of upstream failures: a request Venice never answered is
+// retried once on a new connection, and a second failure reaches the client as
+// a 502; a Venice 429 reaches it as a 429 with what Venice said about the
+// reset. Runs the proxy server with a stubbed Venice client.
 
 let passed = 0;
 let failed = 0;
@@ -28,6 +29,11 @@ function section(title) {
 // The error text seen live (2026-11-22 and 2026-11-23).
 const CONNECTION_ERROR =
   "POST https://outerface.venice.ai/api/inference/chat: error sending request for uri (https://outerface.venice.ai/api/inference/chat): client error (SendRequest): client error (SendRequest): http2 error: stream error received: unspecific protocol error detected";
+
+const fakeResponse = (status, headers = {}) => ({
+  status,
+  headers: new Headers(headers),
+});
 
 const okStream = () => ({ events: (async function* () { yield { kind: "content", content: "ok" }; })() });
 
@@ -55,6 +61,58 @@ function testClientRotation() {
   client.wreqSession = { ...old };
   ok("a request from the old generation does not rotate again", client.rotateTransport(0) === false && client.transportGeneration === 1);
   ok("the current generation rotates", client.rotateTransport(1) === true && client.transportGeneration === 2);
+}
+
+function testRateLimitErrors() {
+  section("upstreamHttpError / rateLimitWaitSeconds");
+  const now = Date.parse("2026-11-24T12:00:00Z");
+  const bare = upstreamHttpError(fakeResponse(429), "{}", now);
+  ok("429 without headers: message unchanged, no wait",
+    bare.message === "HTTP 429: {}" && bare.status === 429 && bare.rateLimit.retryAfterSeconds === undefined &&
+      Object.keys(bare.rateLimit.headers).length === 0, JSON.stringify(bare.rateLimit));
+  const full = upstreamHttpError(fakeResponse(429, {
+    "x-ratelimit-type": "daily",
+    "x-ratelimit-remaining": "0",
+    "x-ratelimit-resets": "1795003200",
+    "retry-after": "3600",
+    "x-other": "no",
+  }), "{}", now);
+  ok("429 with headers: listed in the message in a fixed order",
+    full.message === "HTTP 429: {} [x-ratelimit-type=daily x-ratelimit-remaining=0 x-ratelimit-resets=1795003200 retry-after=3600]",
+    full.message);
+  ok("…retry-after wins and gives the reset time",
+    full.rateLimit.retryAfterSeconds === 3600 && full.rateLimit.resetAt === "2026-11-24T13:00:00.000Z", JSON.stringify(full.rateLimit));
+  const other = upstreamHttpError(fakeResponse(500, { "retry-after": "5" }), "boom", now);
+  ok("other statuses: no rateLimit, plain message", other.message === "HTTP 500: boom" && other.status === 500 && !other.rateLimit);
+  const hostile = upstreamHttpError(fakeResponse(429, { "x-ratelimit-type": `a]b ${"x".repeat(300)}` }), "{}", now);
+  ok("header values: no brackets, bounded length",
+    !hostile.rateLimit.headers["x-ratelimit-type"].includes("]") && hostile.rateLimit.headers["x-ratelimit-type"].length <= 201,
+    hostile.message.slice(0, 80));
+  const broken = upstreamHttpError({ status: 429, headers: { get() { throw new Error("no"); } } }, "{}", now);
+  ok("headers that throw are ignored", broken.message === "HTTP 429: {}" && broken.rateLimit.retryAfterSeconds === undefined);
+  const noHeaders = upstreamHttpError({ status: 429 }, "{}", now);
+  ok("a response without headers is handled", noHeaders.message === "HTTP 429: {}");
+
+  const wait = (headers) => rateLimitWaitSeconds(headers, now);
+  const cases = [
+    ["retry-after seconds", { "retry-after": "120" }, 120],
+    ["retry-after fractional", { "retry-after": "1.2" }, 2],
+    ["retry-after HTTP date", { "retry-after": "Tue, 24 Nov 2026 12:30:00 GMT" }, 1800],
+    ["retry-after 0", { "retry-after": "0" }, undefined],
+    ["retry-after in the past", { "retry-after": "Tue, 24 Nov 2026 11:00:00 GMT" }, undefined],
+    ["retry-after garbage, resets epoch s", { "retry-after": "soon", "x-ratelimit-resets": String(now / 1000 + 600) }, 600],
+    ["resets epoch ms", { "x-ratelimit-resets": String(now + 90_000) }, 90],
+    ["resets ISO date", { "x-ratelimit-resets": "2026-11-25T00:00:00Z" }, 43200],
+    ["resets small number: not guessed", { "x-ratelimit-resets": "3600" }, undefined],
+    ["resets in the past", { "x-ratelimit-resets": String(now / 1000 - 10) }, undefined],
+    ["resets beyond a week: taken as misread", { "x-ratelimit-resets": String(now / 1000 + 8 * 86400) }, undefined],
+    ["resets text without a date", { "x-ratelimit-resets": "tomorrow" }, undefined],
+    ["nothing", {}, undefined],
+  ];
+  for (const [label, headers, expected] of cases) {
+    const got = wait(headers);
+    ok(`wait: ${label}`, got === expected, `${got} !== ${expected}`);
+  }
 }
 
 async function testSharedSessionCreation() {
@@ -100,6 +158,7 @@ async function testProxyRetry() {
     if (step === "conn") throw new Error(CONNECTION_ERROR);
     if (step === "401") throw new Error('HTTP 401: {"error":"Expired Clerk session"}');
     if (step === "500") throw new Error('HTTP 500: {"error":"boom"}');
+    if (typeof step === "object") throw upstreamHttpError(fakeResponse(step.status, step.headers), step.body ?? "{}");
   };
   proxy.client.openChatStream = async () => {
     next();
@@ -133,7 +192,7 @@ async function testProxyRetry() {
         body: JSON.stringify({ model: "zai-org-glm-5-2", messages: [{ role: "user", content: "hi" }], ...body }),
       });
       const text = await response.text();
-      return { status: response.status, text, json: (() => { try { return JSON.parse(text); } catch { return null; } })() };
+      return { status: response.status, headers: response.headers, text, json: (() => { try { return JSON.parse(text); } catch { return null; } })() };
     } finally {
       console.log = originalLog;
       console.warn = originalWarn;
@@ -176,6 +235,76 @@ async function testProxyRetry() {
     const other = await post({ stream: true }, ["500"]);
     ok("upstream HTTP 500 stays a 500, one call", other.status === 500 && calls === 1 && !other.json?.error?.code, `${other.status} ${calls}`);
     ok("no connection retry logged", !warnings.some((line) => line.includes("upstream connection failed")));
+
+    section("Venice 429: passed on as a 429");
+    const limited = await post({ stream: true }, [{ status: 429, headers: { "retry-after": "1800", "x-ratelimit-type": "daily" } }]);
+    ok("status 429 with Retry-After", limited.status === 429 && limited.headers.get("retry-after") === "1800",
+      `${limited.status} ${limited.headers.get("retry-after")}`);
+    ok("OpenAI-style rate limit error with the reset and the upstream reply",
+      limited.json?.error?.type === "rate_limit_error" && limited.json.error.code === "rate_limit_exceeded" &&
+        limited.json.error.message.includes("rate limiting this account; it resets in about 30 min (") &&
+        limited.json.error.message.includes("HTTP 429: {} [x-ratelimit-type=daily retry-after=1800]"), limited.text);
+    ok("no quota words that make opencode stop retrying",
+      !/insufficient[-_\s]?(?:quota|balance)|quota[-_\s]?exceeded|budget exceeded|usage limit|limit exhausted/i.test(limited.json?.error?.message ?? ""));
+    ok("one upstream call, no connection retry", calls === 1 && !warnings.some((line) => line.includes("upstream connection failed")));
+    ok("the headers are in the request failed line",
+      warnings.some((line) => line.includes("request failed:") && line.includes("[x-ratelimit-type=daily retry-after=1800]")), warnings.join(" | "));
+    const unknown = await post({ stream: false }, [{ status: 429 }]);
+    ok("no reset known: 429 without Retry-After, says so",
+      unknown.status === 429 && unknown.headers.get("retry-after") === null &&
+        unknown.json?.error?.message.startsWith("Venice is rate limiting this account; Venice did not say when it resets. Upstream reply: HTTP 429: {}"),
+      `${unknown.status} ${unknown.text}`);
+    const longWait = await post({ stream: true }, [{ status: 429, headers: { "retry-after": "36000" } }]);
+    ok("a long wait reads in hours", longWait.status === 429 && longWait.json?.error?.message.includes("about 10.0 h"), longWait.text);
+    const agentLimited = await post({ model: "deepseek-v4-1-flash-free" }, [{ status: 429, headers: { "retry-after": "60" } }]);
+    ok("agent model: 429 too", agentLimited.status === 429 && agentLimited.headers.get("retry-after") === "60", `${agentLimited.status} ${agentLimited.text.slice(0, 200)}`);
+
+    section("Venice 429 on the proxy's own tool retry, mid-stream");
+    {
+      let attempt = 0;
+      const savedOpen = proxy.client.openChatStream;
+      proxy.client.openChatStream = async () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return { events: (async function* () {
+            yield { kind: "content", reasoning_content: "I will call get_weather." };
+            yield { kind: "content", content: "\n" };
+          })() };
+        }
+        throw failure();
+      };
+      let failure = () => upstreamHttpError(fakeResponse(429, { "retry-after": "120" }), "{}");
+      try {
+        const midStream = await post({
+          stream: true,
+          tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: { city: { type: "string" } } } } }],
+        }, []);
+        const chunks = midStream.text.split("\n\n").map((block) => block.replace(/^data: /, "").trim()).filter(Boolean)
+          .map((data) => (data === "[DONE]" ? data : JSON.parse(data)));
+        ok("reasoning streamed, then a rate_limit_error chunk and [DONE]",
+          midStream.status === 200 && attempt === 2 &&
+            chunks.some((chunk) => chunk.choices?.[0]?.delta?.reasoning_content) &&
+            chunks.at(-2)?.error?.type === "rate_limit_error" && chunks.at(-2)?.error?.message.includes("about 2 min") &&
+            chunks.at(-1) === "[DONE]" && !chunks.some((chunk) => chunk.choices?.[0]?.finish_reason),
+          JSON.stringify(chunks.slice(-3)));
+        ok("the failure is logged", warnings.some((line) => line.includes("tool emulation stream failed") && line.includes("HTTP 429")),
+          warnings.join(" | "));
+
+        attempt = 0;
+        failure = () => new Error(CONNECTION_ERROR);
+        const otherFailure = await post({
+          stream: true,
+          tools: [{ type: "function", function: { name: "get_weather", parameters: { type: "object", properties: {} } } }],
+        }, []);
+        const otherChunks = otherFailure.text.split("\n\n").map((block) => block.replace(/^data: /, "").trim()).filter(Boolean)
+          .map((data) => (data === "[DONE]" ? data : JSON.parse(data)));
+        ok("another error there: a server_error chunk with its message and [DONE]",
+          otherChunks.at(-2)?.error?.type === "server_error" && otherChunks.at(-2)?.error?.message.includes("error sending request for uri") &&
+            otherChunks.at(-1) === "[DONE]", JSON.stringify(otherChunks.slice(-2)));
+      } finally {
+        proxy.client.openChatStream = savedOpen;
+      }
+    }
 
     section("with an auth refresh");
     const authThenConn = await post({ stream: true }, ["conn", "401", "ok"]);
@@ -238,6 +367,7 @@ async function testProxyRetry() {
 
 async function main() {
   testClientRotation();
+  testRateLimitErrors();
   await testSharedSessionCreation();
   await testProxyRetry();
   console.log(`\n${"─".repeat(40)}`);

@@ -206,6 +206,10 @@ Cloudflare rejects plain Node `fetch` on the Venice inference endpoints (`POST /
 
 A request Venice never answers (`error sending request for uri …`, e.g. `http2 error: stream error received: unspecific protocol error detected`) is retried once on a new connection, 0.5 s later, since nothing has reached the client yet. Such failures came in bursts that hit every request in flight at once, 25–40 s after they were sent (2026-11-22/23). Requests that failed together open one new connection between them, not one each; the old one stays open for 15 minutes for the replies still streaming on it, and cookies carry over. The log shows `upstream connection failed after N ms in_flight=N; retrying … once on a new connection` (or `renewed` for the requests that found it already replaced). If the retry fails too, the client gets a 502 with `code: "upstream_connection_error"` instead of a 500, so it knows the failure is upstream and worth retrying. Failures after the reply has started are not retried.
 
+When Venice answers 429 (a `modelOverloaded` 429 only once the proxy's own retries for it ran out), the client gets a 429, not a 500: `type: "rate_limit_error"`, `code: "rate_limit_exceeded"`, a message saying when the limit resets if Venice said so, and a `Retry-After` header in that case. The reset comes from Venice's `retry-after` header, or from `x-ratelimit-resets` when that holds an epoch timestamp or a date (a small number is not guessed at; the headers are undocumented, and Venice was seen sending epoch milliseconds). The headers `x-ratelimit-type`, `x-ratelimit-remaining`, `x-ratelimit-resets` and `retry-after` are appended to the upstream error, so the `request failed` line shows them. opencode 2.4.1 retries a 429 up to ten times and waits `Retry-After` between tries (checked with a 20 s value; its code caps the wait at 15 minutes, not tried), showing the message each time; the message avoids "usage limit" and "quota exceeded", which opencode's code treats as a spent quota and does not retry. On 2026-11-24 Venice answered `HTTP 429: {}` with `x-ratelimit-type=chat x-ratelimit-remaining=0` on every model, after one opencode session sent 10,008 chat requests (about 960M estimated prompt tokens) in 9 hours; `x-ratelimit-resets` was 24 h after the first of those requests. So the web chat appears to allow about 10,000 requests per 24 hours (inferred from one occurrence).
+
+If the proxy's own tool-call retry fails after the first attempt has streamed reasoning, the stream ends with an OpenAI-style error chunk and `[DONE]` (a `rate_limit_error` for a 429, else `server_error`), not silently.
+
 You can also run the cleanup as:
 
 ```powershell
@@ -696,6 +700,7 @@ The proxy logs:
 - on the translate line, `media_omitted=N` when images, files or audio were replaced with a note (see Notes and limitations), and `est_prompt_tokens` (the estimated prompt size sent to Venice) and `large_context=on` when the request opted in to the model's full context
 - total request duration
 - `in_flight` (requests being handled at that moment, the failing one included) on `request failed` and `upstream connection failed` lines
+- on a Venice 429, its rate-limit headers in brackets after the reply, e.g. `HTTP 429: {} [x-ratelimit-type=… retry-after=…]`
 - stream duration for streaming completions
 
 ## Notes and limitations

@@ -241,6 +241,104 @@ export async function* parseJsonLineStream(stream, { onText = null } = {}) {
   }
 }
 
+// Headers Venice sends with a rate limit (its web API lists them in
+// access-control-expose-headers). Not documented; seen live on 2026-11-24:
+//   chat 429 "{}":  x-ratelimit-type=chat x-ratelimit-remaining=0
+//                   x-ratelimit-resets=1795544197805 (epoch ms)
+//   /api/user/session 200: x-ratelimit-type=scrape remaining=99 resets=now+24h
+// The chat limit was hit after about 10,000 chat requests and reset 24 h after
+// the first of them.
+const RATE_LIMIT_HEADERS = ["x-ratelimit-type", "x-ratelimit-remaining", "x-ratelimit-resets", "retry-after"];
+const RATE_LIMIT_HEADER_MAX_CHARS = 200;
+// A reset further away than this is taken as a misread value.
+const RATE_LIMIT_MAX_WAIT_SECONDS = 7 * 24 * 3600;
+
+// The error for a non-2xx upstream response: "HTTP <status>: <body>", with
+// status set and, for a 429, rateLimit = { headers, retryAfterSeconds,
+// resetAt }. The rate-limit headers are also appended to the message so the
+// log shows them.
+export function upstreamHttpError(response, body, now = Date.now()) {
+  const error = new Error(`HTTP ${response.status}: ${body}`);
+  error.status = response.status;
+  if (response.status === 429) {
+    const headers = {};
+    for (const name of RATE_LIMIT_HEADERS) {
+      const value = readHeader(response.headers, name);
+      if (value) {
+        headers[name] = value;
+      }
+    }
+    const retryAfterSeconds = rateLimitWaitSeconds(headers, now);
+    error.rateLimit = {
+      headers,
+      retryAfterSeconds,
+      resetAt: retryAfterSeconds === undefined ? undefined : new Date(now + retryAfterSeconds * 1000).toISOString(),
+    };
+    const shown = Object.entries(headers).map(([name, value]) => `${name}=${value}`);
+    if (shown.length > 0) {
+      error.message += ` [${shown.join(" ")}]`;
+    }
+  }
+  return error;
+}
+
+function readHeader(headers, name) {
+  let value;
+  try {
+    value = headers?.get?.(name);
+  } catch {
+    return "";
+  }
+  if (typeof value !== "string") {
+    return "";
+  }
+  const line = value.replace(/[\u0000-\u001f\u007f\]]+/g, " ").trim();
+  return line.length > RATE_LIMIT_HEADER_MAX_CHARS ? `${line.slice(0, RATE_LIMIT_HEADER_MAX_CHARS)}…` : line;
+}
+
+// Seconds until the limit resets, or undefined when the headers do not say.
+// retry-after is standard (seconds or an HTTP date). x-ratelimit-resets is
+// read only when its value cannot mean anything else: an epoch timestamp in
+// seconds or milliseconds, or a date. A small number could be either seconds
+// left or a count, so it is not guessed at.
+export function rateLimitWaitSeconds(headers, now = Date.now()) {
+  const retryAfter = headers["retry-after"];
+  if (retryAfter) {
+    if (/^\d+(\.\d+)?$/.test(retryAfter)) {
+      return boundedWait(Number(retryAfter));
+    }
+    const at = Date.parse(retryAfter);
+    if (!Number.isNaN(at)) {
+      return boundedWait((at - now) / 1000);
+    }
+  }
+  const resets = headers["x-ratelimit-resets"];
+  if (resets) {
+    if (/^\d+(\.\d+)?$/.test(resets)) {
+      const value = Number(resets);
+      if (value >= 1e12) {
+        return boundedWait((value - now) / 1000);
+      }
+      if (value >= 1e9) {
+        return boundedWait(value - now / 1000);
+      }
+      return undefined;
+    }
+    const at = /\d{4}-\d{2}-\d{2}/.test(resets) ? Date.parse(resets) : Number.NaN;
+    if (!Number.isNaN(at)) {
+      return boundedWait((at - now) / 1000);
+    }
+  }
+  return undefined;
+}
+
+function boundedWait(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds > RATE_LIMIT_MAX_WAIT_SECONDS) {
+    return undefined;
+  }
+  return Math.ceil(seconds);
+}
+
 export function decodeJwtPayload(jwt) {
   if (!jwt || typeof jwt !== "string") {
     return null;
@@ -600,7 +698,7 @@ export class VeniceWebClient {
     const text = await response.text();
     const data = text ? safeJsonParse(text) : null;
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+      throw upstreamHttpError(response, typeof data === "string" ? data : JSON.stringify(data));
     }
     return data;
   }
@@ -915,7 +1013,7 @@ export class VeniceWebClient {
     const text = await response.text();
     startUpstreamDump(requestBody, response)?.(text);
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw upstreamHttpError(response, text);
     }
 
     const events = text
@@ -984,7 +1082,7 @@ export class VeniceWebClient {
     if (!response.ok) {
       const text = await response.text();
       dump?.(text);
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw upstreamHttpError(response, text);
     }
 
     return {
@@ -1017,7 +1115,7 @@ export class VeniceWebClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw upstreamHttpError(response, text);
     }
 
     return {
@@ -1057,7 +1155,7 @@ export class VeniceWebClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw upstreamHttpError(response, text);
     }
 
     return {

@@ -302,9 +302,10 @@ function logToolEmulationEvent({ type, reason, outputs }, model) {
   console.warn(`[${nowIso()}] tool emulation: ${message} (${reason}) model=${model}${outputPart}`);
 }
 
-function json(res, status, body) {
+function json(res, status, body, headers = {}) {
   const text = JSON.stringify(body);
   res.writeHead(status, {
+    ...headers,
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(text),
   });
@@ -361,6 +362,41 @@ function isModelOverloadedError(error) {
     error.message.startsWith("HTTP 429:") &&
     error.message.includes('"error":"modelOverloaded"')
   );
+}
+
+// The OpenAI-style error and response headers for a Venice 429 the proxy
+// could not retry, or null for any other error. It goes out as a 429, not a
+// 500, with Retry-After when Venice said when the limit resets: opencode 2.4.1
+// retries a 429 up to ten times, waiting Retry-After between tries (seen with
+// 20 s; its code caps the wait at 15 minutes). The message avoids words such
+// as "usage limit" or "quota exceeded", which opencode's code reads as a spent
+// quota and does not retry.
+function rateLimitError(error) {
+  if (!(error instanceof Error) || error.status !== 429) {
+    return null;
+  }
+  const wait = error.rateLimit?.retryAfterSeconds;
+  const when = wait === undefined
+    ? "Venice did not say when it resets"
+    : `it resets in about ${formatWait(wait)} (${error.rateLimit.resetAt})`;
+  return {
+    error: {
+      message: `${isModelOverloadedError(error) ? "Venice reports the model is overloaded" : "Venice is rate limiting this account"}; ${when}. Upstream reply: ${error.message}`,
+      type: "rate_limit_error",
+      code: "rate_limit_exceeded",
+    },
+    headers: wait === undefined ? {} : { "retry-after": String(wait) },
+  };
+}
+
+function formatWait(seconds) {
+  if (seconds < 120) {
+    return `${seconds} s`;
+  }
+  if (seconds < 2 * 3600) {
+    return `${Math.round(seconds / 60)} min`;
+  }
+  return `${(seconds / 3600).toFixed(1)} h`;
 }
 
 function isUnauthorizedError(error) {
@@ -1596,7 +1632,19 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
         error instanceof Error ? error.message : String(error)
       }`,
     );
-    res.end();
+    // The proxy's own retry can fail after the first attempt has streamed
+    // reasoning. Ending the stream without a word would read as a finished
+    // empty answer, so the client gets the error, as with streamError above.
+    if (!res.writableEnded && !res.destroyed) {
+      writeSseChunk(res, {
+        error: rateLimitError(error)?.error ?? {
+          message: error instanceof Error ? error.message : String(error),
+          type: "server_error",
+        },
+      });
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
   }
   logDone(streamStartedAt);
 }
@@ -2316,13 +2364,19 @@ export function createVeniceOpenAiProxyServer(
         logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
         return;
       }
+      console.warn(
+        `[${nowIso()}] request failed: ${req.method} ${url.pathname} in_flight=${proxy.inFlight} ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const rateLimit = rateLimitError(error);
+      if (rateLimit) {
+        json(res, 429, { error: rateLimit.error }, rateLimit.headers);
+        logOutgoingResponse({ req, url, status: 429, durationMs: Date.now() - startedAt });
+        return;
+      }
       // A request Venice never answered is a bad gateway, not a proxy bug:
       // 502 tells clients the failure is upstream and worth retrying.
       const upstream = isUpstreamConnectionError(error);
       const status = upstream ? 502 : 500;
-      console.warn(
-        `[${nowIso()}] request failed: ${req.method} ${url.pathname} in_flight=${proxy.inFlight} ${error instanceof Error ? error.message : String(error)}`,
-      );
       json(res, status, {
         error: {
           message: error instanceof Error ? error.message : String(error),
