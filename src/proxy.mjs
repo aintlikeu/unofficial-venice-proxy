@@ -147,6 +147,8 @@ function buildSupportInfo(proxy) {
       started_at: new Date(STARTED_AT).toISOString(),
       uptime_seconds: Math.floor((Date.now() - STARTED_AT) / 1000),
     },
+    // Latest x-ratelimit-* state per type, e.g. chat: { remaining, resets_at, seen_at }.
+    rate_limits: proxy.client.rateLimits ?? {},
     session: {
       session_file: proxy.client.sessionFile,
       email: proxy.auth?.userSession?.email ?? proxy.client.email ?? null,
@@ -275,8 +277,12 @@ function logOutgoingResponse({
     typeof toolCount === "number"
       ? ` tools=${toolCount} tool_calls=${toolCallCount}${toolAttempts > 1 ? ` tool_attempts=${toolAttempts}` : ""}`
       : "";
+  // The latest chat limit Venice reported (it may come from a concurrent
+  // request); POST requests are the ones that use it.
+  const chatLimit = req.method === "POST" ? req.veniceProxy?.client?.rateLimits?.chat : null;
+  const limitPart = chatLimit ? ` venice_chat_remaining=${chatLimit.remaining}` : "";
   console.log(
-    `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength}${toolsPart} duration_ms=${durationMs}${streamPart}`,
+    `[${nowIso()}] outgoing ${req.method} ${url.pathname} status=${status}${modelPart} content_chars=${contentLength} reasoning_chars=${reasoningLength}${toolsPart} duration_ms=${durationMs}${streamPart}${limitPart}`,
   );
 }
 
@@ -397,6 +403,10 @@ function formatWait(seconds) {
     return `${Math.round(seconds / 60)} min`;
   }
   return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isUnauthorizedError(error) {
@@ -969,9 +979,30 @@ function buildVeniceChatOptions({
   return options;
 }
 
+// Remaining Venice chat requests at which a warning is logged, once per
+// threshold per window. The web chat allows 10,000 requests per 24 hours,
+// counted from the first request after the previous window ended (seen
+// 2026-11-24: x-ratelimit-type=chat, remaining 9998 after two requests).
+const CHAT_LIMIT_WARN_AT = [5000, 2000, 1000, 500, 200, 100, 50, 10];
+
+// Venice's reset time jitters by a few milliseconds between replies of one
+// window (24.765-24.798 s seen live); a new window moves it by up to a day.
+const CHAT_WINDOW_RESET_TOLERANCE_MS = 60_000;
+
+function isNewChatWindow(previous, state) {
+  if (!previous.resets_at || !state.resets_at) {
+    return previous.resets_at !== state.resets_at;
+  }
+  return Math.abs(Date.parse(state.resets_at) - Date.parse(previous.resets_at)) > CHAT_WINDOW_RESET_TOLERANCE_MS;
+}
+
 class VeniceOpenAiProxy {
   constructor() {
     this.client = new VeniceWebClient();
+    // Lowest threshold of CHAT_LIMIT_WARN_AT already warned about in the
+    // current chat window, or null.
+    this.chatLimitWarnedAt = null;
+    this.client.onRateLimit = (type, state, previous) => this.noteRateLimit(type, state, previous);
     this.agentic = new AgenticProxy(this.client);
     this.authPromise = null;
     this.auth = null;
@@ -1025,6 +1056,44 @@ class VeniceOpenAiProxy {
     return await this.authPromise;
   }
 
+  // Logs the start of each chat window and a warning when the remaining
+  // requests fall to a threshold. Replies can arrive out of order, so a
+  // threshold is warned about once per window, however often it is seen.
+  noteRateLimit(type, state, previous) {
+    if (type !== "chat") {
+      return;
+    }
+    if (!previous || isNewChatWindow(previous, state)) {
+      this.chatLimitWarnedAt = null;
+      console.log(
+        `[${nowIso()}] venice chat limit: remaining=${state.remaining} resets_at=${state.resets_at ?? "unknown"}${
+          previous ? ` (new window; the previous one ended with ${previous.remaining} left)` : ""
+        }`,
+      );
+    }
+    const crossed = CHAT_LIMIT_WARN_AT.filter((threshold) => state.remaining <= threshold).at(-1);
+    if (crossed !== undefined && (this.chatLimitWarnedAt === null || crossed < this.chatLimitWarnedAt)) {
+      this.chatLimitWarnedAt = crossed;
+      const wait = state.resets_at ? Math.max(0, Math.round((Date.parse(state.resets_at) - Date.now()) / 1000)) : null;
+      console.warn(
+        `[${nowIso()}] venice chat limit low: remaining=${state.remaining} (at or below ${crossed}) resets_at=${state.resets_at ?? "unknown"}${
+          wait === null ? "" : ` in ${formatWait(wait)}`
+        }`,
+      );
+    }
+  }
+
+  // Saving the session is best effort: a session that works stays in use when
+  // the file cannot be written (e.g. the disk is full), and the next refresh
+  // tries again.
+  saveSession(extra) {
+    try {
+      this.client.writeSavedSession(extra);
+    } catch (error) {
+      console.warn(`[${nowIso()}] auth: could not save the session file ${this.client.sessionFile}; keeping the session in memory: ${errorText(error)}`);
+    }
+  }
+
   async authenticate() {
     // The proxy is long-lived, so once a session is in memory a Clerk touch is
     // enough to mint the next short-lived JWT: no session file read, no bootstrap.
@@ -1033,7 +1102,7 @@ class VeniceOpenAiProxy {
         const clerkJwt = await this.client.refreshClerkJwt();
         const userSession =
           this.auth?.userSession ?? (await this.client.getUserSession(clerkJwt));
-        this.client.writeSavedSession({ lastValidatedAt: Date.now() });
+        this.saveSession({ lastValidatedAt: Date.now() });
         return this.cacheAuth({
           source: "refresh",
           login: {
@@ -1043,7 +1112,8 @@ class VeniceOpenAiProxy {
           },
           userSession,
         });
-      } catch {
+      } catch (error) {
+        console.warn(`[${nowIso()}] auth: refreshing the session in memory failed; trying the session file: ${errorText(error)}`);
         this.invalidateAuth();
       }
     }
@@ -1057,7 +1127,7 @@ class VeniceOpenAiProxy {
     if (this.client.hasUsableSavedJwt(saved)) {
       try {
         const userSession = await this.client.getUserSession(saved.clerkJwt);
-        this.client.writeSavedSession({ lastValidatedAt: Date.now() });
+        this.saveSession({ lastValidatedAt: Date.now() });
         return this.cacheAuth({
           source: "session",
           login: {
@@ -1067,7 +1137,8 @@ class VeniceOpenAiProxy {
           },
           userSession,
         });
-      } catch {
+      } catch (error) {
+        console.warn(`[${nowIso()}] auth: the saved JWT was rejected; restoring from cookies: ${errorText(error)}`);
         this.client.restoreSavedSession(saved);
       }
     }
@@ -1075,7 +1146,7 @@ class VeniceOpenAiProxy {
     try {
       const restored = await this.client.restoreSessionFromCookies();
       const userSession = await this.client.getUserSession(restored.clerkJwt);
-      this.client.writeSavedSession({
+      this.saveSession({
         lastValidatedAt: Date.now(),
         restoredAt: Date.now(),
       });
@@ -1088,7 +1159,8 @@ class VeniceOpenAiProxy {
         },
         userSession,
       });
-    } catch {
+    } catch (error) {
+      console.warn(`[${nowIso()}] auth: restoring the session from cookies failed: ${errorText(error)}`);
       throw this.buildMissingSessionError();
     }
   }
@@ -1654,6 +1726,8 @@ export function createVeniceOpenAiProxyServer(
 ) {
   return http.createServer(async (req, res) => {
     const startedAt = Date.now();
+    // Read by logOutgoingResponse for the chat limit.
+    req.veniceProxy = proxy;
     proxy.inFlight += 1;
     res.once("close", () => {
       proxy.inFlight -= 1;

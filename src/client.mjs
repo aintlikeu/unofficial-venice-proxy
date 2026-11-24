@@ -312,24 +312,42 @@ export function rateLimitWaitSeconds(headers, now = Date.now()) {
       return boundedWait((at - now) / 1000);
     }
   }
-  const resets = headers["x-ratelimit-resets"];
-  if (resets) {
-    if (/^\d+(\.\d+)?$/.test(resets)) {
-      const value = Number(resets);
-      if (value >= 1e12) {
-        return boundedWait((value - now) / 1000);
-      }
-      if (value >= 1e9) {
-        return boundedWait(value - now / 1000);
-      }
-      return undefined;
-    }
-    const at = /\d{4}-\d{2}-\d{2}/.test(resets) ? Date.parse(resets) : Number.NaN;
-    if (!Number.isNaN(at)) {
-      return boundedWait((at - now) / 1000);
-    }
+  const resetAt = parseResetsAt(headers["x-ratelimit-resets"]);
+  return resetAt === null ? undefined : boundedWait((resetAt - now) / 1000);
+}
+
+// x-ratelimit-resets as epoch milliseconds, or null: an epoch timestamp in
+// milliseconds (what Venice sends) or seconds, or a date.
+function parseResetsAt(resets) {
+  if (!resets) {
+    return null;
   }
-  return undefined;
+  if (/^\d+(\.\d+)?$/.test(resets)) {
+    const value = Number(resets);
+    if (value >= 1e12) {
+      return value;
+    }
+    return value >= 1e9 ? value * 1000 : null;
+  }
+  const at = /\d{4}-\d{2}-\d{2}/.test(resets) ? Date.parse(resets) : Number.NaN;
+  return Number.isNaN(at) ? null : at;
+}
+
+// { type, remaining, resets_at, seen_at } from a response's rate-limit
+// headers, or null when it has no type or no whole-number remaining.
+export function readRateLimitState(headers, now = Date.now()) {
+  const type = readHeader(headers, "x-ratelimit-type");
+  const remainingText = readHeader(headers, "x-ratelimit-remaining");
+  if (!type || !/^\d+$/.test(remainingText)) {
+    return null;
+  }
+  const resetAt = parseResetsAt(readHeader(headers, "x-ratelimit-resets"));
+  return {
+    type,
+    remaining: Number(remainingText),
+    resets_at: resetAt === null ? null : new Date(resetAt).toISOString(),
+    seen_at: new Date(now).toISOString(),
+  };
 }
 
 function boundedWait(seconds) {
@@ -558,6 +576,12 @@ export class VeniceWebClient {
     // Bumped by rotateTransport; lets callers tell whether the session they
     // used is still the current one.
     this.transportGeneration = 0;
+    // The latest rate-limit state Venice reported, by x-ratelimit-type
+    // ("chat", "scrape", ...): { remaining, resets_at, seen_at }. Venice sends
+    // it with successful replies too; onRateLimit(type, state, previous) is
+    // called for each one.
+    this.rateLimits = {};
+    this.onRateLimit = null;
     this.cookies = new CookieJar();
     this.veniceVersion = DEFAULT_VENICE_VERSION;
     this.middlefaceVersion = DEFAULT_MIDDLEFACE_VERSION;
@@ -677,6 +701,7 @@ export class VeniceWebClient {
         headers: Object.fromEntries(headers.entries()),
       });
       this.syncCookiesFromWreq();
+      this.recordRateLimit(response);
       return response;
     }
 
@@ -691,7 +716,21 @@ export class VeniceWebClient {
     });
 
     this.cookies.setFromResponse(url, response);
+    this.recordRateLimit(response);
     return response;
+  }
+
+  recordRateLimit(response, now = Date.now()) {
+    const state = readRateLimitState(response?.headers, now);
+    if (!state) {
+      return;
+    }
+    const previous = this.rateLimits[state.type] ?? null;
+    const { type, ...rest } = state;
+    this.rateLimits[type] = rest;
+    try {
+      this.onRateLimit?.(type, rest, previous);
+    } catch {}
   }
 
   async readJson(response) {
@@ -1302,7 +1341,20 @@ export class VeniceWebClient {
       cookies: this.cookies.export(),
       ...extra,
     };
-    fs.writeFileSync(this.sessionFile, JSON.stringify(snapshot, null, 2));
+    // Written to a temporary file and renamed over the old one: writing in
+    // place truncates first, so a failed write (the disk filled up on
+    // 2026-11-24) left an empty file and the session was lost.
+    const text = JSON.stringify(snapshot, null, 2);
+    const temporary = `${this.sessionFile}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(temporary, text, { mode: 0o600 });
+      fs.renameSync(temporary, this.sessionFile);
+    } catch (error) {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {}
+      throw error;
+    }
     return snapshot;
   }
 

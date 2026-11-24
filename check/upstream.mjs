@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient, rateLimitWaitSeconds, upstreamHttpError } from "../src/client.mjs";
+import { VeniceWebClient, rateLimitWaitSeconds, readRateLimitState, upstreamHttpError } from "../src/client.mjs";
 import { createVeniceOpenAiProxy, createVeniceOpenAiProxyServer } from "../src/proxy.mjs";
 
 // Offline check of upstream failures: a request Venice never answered is
@@ -112,6 +115,170 @@ function testRateLimitErrors() {
   for (const [label, headers, expected] of cases) {
     const got = wait(headers);
     ok(`wait: ${label}`, got === expected, `${got} !== ${expected}`);
+  }
+}
+
+const fakeJwt = (expSeconds) =>
+  `e30.${Buffer.from(JSON.stringify({ exp: expSeconds })).toString("base64url")}.sig`;
+
+async function testChatLimitMonitoring() {
+  section("chat limit: recorded from every reply, warned at thresholds");
+  const now = Date.parse("2026-11-24T18:27:24Z");
+  const live = readRateLimitState(new Headers({
+    "x-ratelimit-type": "chat", "x-ratelimit-remaining": "9997", "x-ratelimit-resets": "1795631244767",
+  }), now);
+  ok("live headers: type, remaining and the exact reset time",
+    live?.type === "chat" && live.remaining === 9997 && live.resets_at === "2026-11-25T18:27:24.767Z" &&
+      live.seen_at === "2026-11-24T18:27:24.000Z", JSON.stringify(live));
+  ok("the reset time does not move with the clock",
+    readRateLimitState(new Headers({ "x-ratelimit-type": "chat", "x-ratelimit-remaining": "1", "x-ratelimit-resets": "1795631244767" }), now + 1234)
+      ?.resets_at === live.resets_at);
+  ok("no type: ignored", readRateLimitState(new Headers({ "x-ratelimit-remaining": "5" })) === null);
+  ok("remaining not a whole number: ignored",
+    readRateLimitState(new Headers({ "x-ratelimit-type": "chat", "x-ratelimit-remaining": "-1" })) === null &&
+      readRateLimitState(new Headers({ "x-ratelimit-type": "chat", "x-ratelimit-remaining": "lots" })) === null);
+  ok("unreadable reset: null", readRateLimitState(new Headers({ "x-ratelimit-type": "chat", "x-ratelimit-remaining": "5", "x-ratelimit-resets": "3600" }))?.resets_at === null);
+
+  const client = new VeniceWebClient({ transport: "fetch" });
+  const seen = [];
+  client.onRateLimit = (type, state, previous) => seen.push({ type, remaining: state.remaining, previous: previous?.remaining ?? null });
+  client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": "10", "x-ratelimit-resets": "1795631244767" }));
+  client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "scrape", "x-ratelimit-remaining": "99" }));
+  client.recordRateLimit(fakeResponse(200, {}));
+  client.recordRateLimit({ status: 200 });
+  client.recordRateLimit(fakeResponse(429, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": "0", "x-ratelimit-resets": "1795631244767" }));
+  ok("kept per type, the latest wins", client.rateLimits.chat?.remaining === 0 && client.rateLimits.scrape?.remaining === 99);
+  ok("callback gets each reply with the previous state",
+    JSON.stringify(seen) === JSON.stringify([
+      { type: "chat", remaining: 10, previous: null },
+      { type: "scrape", remaining: 99, previous: null },
+      { type: "chat", remaining: 0, previous: 10 },
+    ]), JSON.stringify(seen));
+  client.onRateLimit = () => {
+    throw new Error("boom");
+  };
+  client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": "7" }));
+  ok("a throwing callback does not break the request", client.rateLimits.chat.remaining === 7);
+
+  const proxy = createVeniceOpenAiProxy();
+  const lines = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args) => lines.push(`LOG ${args.join(" ")}`);
+  console.warn = (...args) => lines.push(`WARN ${args.join(" ")}`);
+  const resetsA = String(Date.now() + 3 * 3600_000);
+  const resetsB = String(Date.now() + 27 * 3600_000);
+  // Each reply's reset time jitters by a few ms, as live (24.765-24.798 s).
+  let jitter = 0;
+  const reply = (remaining, resets = resetsA) =>
+    proxy.client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": String(remaining), "x-ratelimit-resets": String(Number(resets) + (jitter++ % 3) * 17 - 17) }));
+  try {
+    for (const remaining of [9998, 5001, 5000, 4999, 3000, 1999, 3000, 1500]) reply(remaining);
+    reply(9999, resetsB);
+    reply(4000, resetsB);
+    proxy.client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "scrape", "x-ratelimit-remaining": "1" }));
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+  const windowLines = lines.filter((line) => line.includes("venice chat limit: "));
+  const warnLines = lines.filter((line) => line.includes("venice chat limit low"));
+  ok("window start logged on the first reply and on a new reset time",
+    windowLines.length === 2 && /^LOG .*remaining=9998 resets_at=\S+Z$/.test(windowLines[0]) &&
+      windowLines[1].includes("remaining=9999") && windowLines[1].includes("(new window; the previous one ended with 1500 left)"),
+    windowLines.join(" | "));
+  ok("one warning per threshold, out-of-order replies ignored, reset after a new window",
+    warnLines.length === 3 && warnLines[0].includes("remaining=5000 (at or below 5000)") &&
+      warnLines[1].includes("remaining=1999 (at or below 2000)") && /in 3\.0 h|in 180 min|in 2\.9 h/.test(warnLines[1]) &&
+      warnLines[2].includes("remaining=4000 (at or below 5000)") && warnLines.every((line) => line.startsWith("WARN ")),
+    warnLines.join(" | "));
+  ok("other limit types are not warned about", !lines.some((line) => line.includes("remaining=1 ")));
+  const lowStart = createVeniceOpenAiProxy();
+  const lowLines = [];
+  console.warn = (...args) => lowLines.push(args.join(" "));
+  console.log = () => {};
+  try {
+    lowStart.client.recordRateLimit(fakeResponse(429, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": "0", "x-ratelimit-resets": resetsA }));
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+  ok("first seen at 0 (a 429): one warning at the lowest threshold",
+    lowLines.length === 1 && lowLines[0].includes("remaining=0 (at or below 10)"), lowLines.join(" | "));
+}
+
+async function testSessionFile() {
+  section("session file: atomic write, best-effort save");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "venice-session-"));
+  try {
+    const file = path.join(dir, "session.json");
+    const client = new VeniceWebClient({ transport: "fetch", sessionFile: file });
+    client.sessionId = "sess_1";
+    client.clerkJwt = fakeJwt(2_000_000_000);
+    client.writeSavedSession({ lastValidatedAt: 1 });
+    const first = JSON.parse(fs.readFileSync(file, "utf8"));
+    ok("written and readable", first.sessionId === "sess_1" && first.lastValidatedAt === 1);
+    ok("owner-only permissions", (fs.statSync(file).mode & 0o777) === 0o600, (fs.statSync(file).mode & 0o777).toString(8));
+    ok("no temporary file left", fs.readdirSync(dir).join() === "session.json", fs.readdirSync(dir).join());
+
+    // A write that fails (here: the temporary path is a directory) must leave
+    // the old file whole; writing in place left it empty when the disk filled.
+    fs.mkdirSync(`${file}.${process.pid}.tmp`);
+    client.sessionId = "sess_2";
+    let threw = null;
+    try {
+      client.writeSavedSession({ lastValidatedAt: 2 });
+    } catch (error) {
+      threw = error;
+    }
+    ok("a failed write throws", Boolean(threw));
+    ok("…and the previous session file is intact", JSON.parse(fs.readFileSync(file, "utf8")).sessionId === "sess_1");
+    fs.rmdirSync(`${file}.${process.pid}.tmp`);
+
+    const proxy = createVeniceOpenAiProxy();
+    proxy.client.sessionFile = file;
+    proxy.client.sessionId = "sess_1";
+    proxy.client.refreshClerkJwt = async () => fakeJwt(Math.floor(Date.now() / 1000) + 600);
+    proxy.client.getUserSession = async () => ({ ok: true });
+    proxy.client.writeSavedSession = () => {
+      throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" });
+    };
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    let auth = null;
+    try {
+      auth = await proxy.ensureAuth();
+    } finally {
+      console.warn = originalWarn;
+    }
+    ok("refresh succeeds although the file cannot be written", auth?.source === "refresh" && Boolean(auth.login.clerkJwt));
+    ok("…with a warning naming the file and the error",
+      warnings.some((line) => line.includes("could not save the session file") && line.includes(file) && line.includes("ENOSPC")), warnings.join(" | "));
+
+    const broken = createVeniceOpenAiProxy();
+    fs.writeFileSync(file, "");
+    broken.client.sessionFile = file;
+    broken.client.sessionId = "sess_1";
+    broken.client.refreshClerkJwt = async () => {
+      throw new Error('HTTP 401: {"errors":[{"code":"session_expired"}]}');
+    };
+    warnings.length = 0;
+    console.warn = (...args) => warnings.push(args.join(" "));
+    let failure = null;
+    try {
+      await broken.ensureAuth();
+    } catch (error) {
+      failure = error;
+    } finally {
+      console.warn = originalWarn;
+    }
+    ok("refresh failure with an empty file: missing-session error",
+      /No valid Venice web session found/.test(failure?.message ?? ""), failure?.message);
+    ok("…and the refresh error is logged, not swallowed",
+      warnings.some((line) => line.includes("refreshing the session in memory failed") && line.includes("session_expired")), warnings.join(" | "));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -306,6 +473,41 @@ async function testProxyRetry() {
       }
     }
 
+    section("chat limit in the outgoing line and /support/info");
+    {
+      const savedOpen = proxy.client.openChatStream;
+      proxy.client.openChatStream = async () => {
+        proxy.client.recordRateLimit(fakeResponse(200, { "x-ratelimit-type": "chat", "x-ratelimit-remaining": "4321", "x-ratelimit-resets": "1795631244767" }));
+        return okStream();
+      };
+      const logged = [];
+      try {
+        script = [];
+        console.log = (...args) => logged.push(args.join(" "));
+        console.warn = () => {};
+        const response = await fetch(`${base}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "zai-org-glm-5-2", stream: true, messages: [{ role: "user", content: "hi" }] }),
+        });
+        await response.text();
+        const info = await (await fetch(`${base.replace(/\/v1$/, "")}/support/info`)).json();
+        console.log = originalLog;
+        console.warn = originalWarn;
+        ok("outgoing line has venice_chat_remaining",
+          logged.some((line) => line.includes("outgoing POST /v1/chat/completions status=200") && line.endsWith(" venice_chat_remaining=4321")),
+          logged.filter((line) => line.includes("outgoing")).join(" | "));
+        ok("GET lines do not", !logged.some((line) => line.includes("outgoing GET") && line.includes("venice_chat_remaining")));
+        ok("/support/info shows rate_limits.chat",
+          info.rate_limits?.chat?.remaining === 4321 && info.rate_limits.chat.resets_at === "2026-11-25T18:27:24.767Z", JSON.stringify(info.rate_limits));
+      } finally {
+        console.log = originalLog;
+        console.warn = originalWarn;
+        proxy.client.openChatStream = savedOpen;
+        delete proxy.client.rateLimits.chat;
+      }
+    }
+
     section("with an auth refresh");
     const authThenConn = await post({ stream: true }, ["conn", "401", "ok"]);
     ok("connection failure, then 401 on the retry, then success", authThenConn.status === 200 && calls === 3, `${authThenConn.status} ${calls}`);
@@ -368,6 +570,8 @@ async function testProxyRetry() {
 async function main() {
   testClientRotation();
   testRateLimitErrors();
+  await testChatLimitMonitoring();
+  await testSessionFile();
   await testSharedSessionCreation();
   await testProxyRetry();
   console.log(`\n${"─".repeat(40)}`);

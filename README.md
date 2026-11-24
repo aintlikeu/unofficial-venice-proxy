@@ -151,10 +151,13 @@ curl -s http://powerserver.local:3456/support/info
   "service": "venice-openai-proxy",
   "build": { "commit": "e9f6594...", "commit_short": "e9f6594", "branch": "main", "source": "git" },
   "runtime": { "node": "v25.9.0", "pid": 7112, "started_at": "...", "uptime_seconds": 24 },
+  "rate_limits": { "chat": { "remaining": 9964, "resets_at": "2026-11-25T18:27:24.767Z", "seen_at": "..." }, "scrape": { "remaining": 99, "resets_at": "...", "seen_at": "..." } },
   "session": { "session_file": ".venice-web-session.json", "email": "you@example.com", "has_cached_auth": true, "auth_expires_at": "..." },
   "models": { "sampling_defaults_cached": 261, "loaded_at": "..." }
 }
 ```
+
+`rate_limits` holds the latest `x-ratelimit-*` state Venice reported per type (empty until the first upstream reply after a start); `chat.remaining` is how many chat requests are left in the current 24-hour window.
 
 The commit is read straight from the checkout's `.git` (loose refs and `packed-refs` both work), with no `git` binary required. Docker images have no `.git`, so pass the commit at build time and `source` becomes `env`:
 
@@ -701,6 +704,9 @@ The proxy logs:
 - total request duration
 - `in_flight` (requests being handled at that moment, the failing one included) on `request failed` and `upstream connection failed` lines
 - on a Venice 429, its rate-limit headers in brackets after the reply, e.g. `HTTP 429: {} [x-ratelimit-type=… retry-after=…]`
+- `venice_chat_remaining=N` on outgoing POST lines: the chat requests Venice says are left (the latest reply's `x-ratelimit-remaining`, which may come from a concurrent request). The web chat allows 10,000 requests per 24 hours; the window starts with the first request after the previous one ended
+- `venice chat limit: remaining=N resets_at=…` when a window is first seen (after a start, or when the reset time moves by more than a minute; it jitters by a few ms within a window), and a `venice chat limit low: remaining=N (at or below T) resets_at=… in …` warning once per window at 5000, 2000, 1000, 500, 200, 100, 50 and 10 left
+- `auth:` warnings when refreshing or restoring the session fails (with the error) and when the session file cannot be saved; the session file is written to a temporary file and renamed, so a failed write (e.g. a full disk, which emptied it on 2026-11-24) keeps the old file, and the working session stays in use
 - stream duration for streaming completions
 
 ## Notes and limitations
